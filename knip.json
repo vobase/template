@@ -1,0 +1,40 @@
+{
+  "$schema": "https://unpkg.com/knip@6/schema.json",
+  "tags": [
+    "-lintignore"
+  ],
+  "entry": [
+    "server.ts",
+    "src/main.tsx",
+    "scripts/*.ts",
+    "vobase.config.ts",
+    "drizzle.config.ts",
+    "vite.config.ts",
+    "modules/*/index.ts",
+    "modules/*/seed.ts",
+    "modules/seed-types.ts"
+  ],
+  "project": [
+    "src/**/*.{ts,tsx}",
+    "modules/**/*.{ts,tsx}",
+    "scripts/**/*.ts",
+    "*.config.ts"
+  ],
+  "ignore": [
+    "src/components/ai-elements/**",
+    "src/components/data-table/**",
+    "src/components/ui/**",
+    "src/lib/store/**",
+    "src/lib/table-schema/**",
+    "src/lib/compose-refs.ts",
+    "**/*.test.ts",
+    "**/*.test.tsx"
+  ],
+  "ignoreDependencies": [
+    "shadcn",
+    "mastra",
+    "@fontsource-variable/geist",
+    "tailwindcss",
+    "tw-animate-css"
+  ]
+}
