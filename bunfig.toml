@@ -1,0 +1,5 @@
+[run]
+bun = true
+
+[test]
+exclude = ["e2e/**"]
