@@ -1,0 +1,60 @@
+{
+  "$schema": "https://unpkg.com/knip@6/schema.json",
+  "tags": [
+    "-lintignore"
+  ],
+  "entry": [
+    "main.ts",
+    "runtime/bootstrap.ts",
+    "runtime/modules.ts",
+    "auth/index.ts",
+    "auth/middleware/*.ts",
+    "wake/*.ts",
+    "modules/*/module.ts",
+    "modules/*/cli.ts",
+    "modules/*/agent.ts",
+    "modules/*/seed.ts",
+    "modules/*/jobs.ts",
+    "modules/*/web.ts",
+    "modules/*/verbs/*.ts",
+    "modules/*/tools/*.ts",
+    "modules/*/handlers/*.ts",
+    "src/main.tsx",
+    "scripts/*.ts",
+    "drizzle.config.ts",
+    "vite.config.ts",
+    "tests/e2e/**/*.ts",
+    "tests/smoke/**/*.ts",
+    "tests/helpers/**/*.ts"
+  ],
+  "project": [
+    "src/**/*.{ts,tsx}",
+    "modules/**/*.{ts,tsx}",
+    "runtime/**/*.ts",
+    "auth/**/*.ts",
+    "wake/**/*.ts",
+    "scripts/**/*.ts",
+    "tests/**/*.ts",
+    "*.config.ts"
+  ],
+  "ignore": [
+    "src/components/ai-elements/**",
+    "src/components/data-table/**",
+    "src/components/ui/**",
+    "src/lib/store/**",
+    "src/lib/table-schema/**",
+    "src/lib/compose-refs.ts",
+    "**/*.test.ts",
+    "**/*.test.tsx"
+  ],
+  "ignoreDependencies": [
+    "@fontsource-variable/geist",
+    "embla-carousel-react",
+    "tw-animate-css",
+    "vaul",
+    "shiki",
+    "tailwindcss",
+    "shadcn",
+    "@tanstack/virtual-file-routes"
+  ]
+}

@@ -1,0 +1,77 @@
+import { type OrganizationEnv, requireOrganization } from '@auth/middleware'
+import { zValidator } from '@hono/zod-validator'
+import {
+  get as getConversation,
+  listActivity,
+  list as listConversations,
+  listMessagingByContact,
+} from '@modules/messaging/service/conversations'
+import { list as listMessages } from '@modules/messaging/service/messages'
+import { list as listApprovals } from '@modules/messaging/service/pending-approvals'
+import { Hono } from 'hono'
+import { z } from 'zod'
+
+import approvals from './approvals'
+import notes from './notes'
+import reassign from './reassign'
+import reply from './reply'
+import resolve from './resolve'
+import snooze from './snooze'
+
+const app = new Hono<OrganizationEnv>()
+  .use('*', requireOrganization)
+  .get('/health', (c) => c.json({ module: 'messaging', status: 'ok' }))
+  .get('/conversations', async (c) => {
+    const organizationId = c.get('organizationId')
+    const status = c.req.query('status')?.split(',').filter(Boolean)
+    const tabRaw = c.req.query('tab')
+    const tab = tabRaw === 'active' || tabRaw === 'later' || tabRaw === 'done' ? tabRaw : undefined
+    const owner = c.req.query('owner') || undefined
+    const contactId = c.req.query('contactId') || undefined
+    const grouped = c.req.query('grouped') === '1'
+    if (grouped) {
+      const result = await listMessagingByContact(organizationId, {
+        status: status?.length ? status : undefined,
+        owner,
+      })
+      return c.json(result)
+    }
+    const rows = await listConversations(organizationId, {
+      status: status?.length ? status : undefined,
+      tab,
+      owner,
+      contactId,
+    })
+    return c.json(rows)
+  })
+  .get('/conversations/:id', async (c) => {
+    try {
+      const row = await getConversation(c.req.param('id'))
+      return c.json(row)
+    } catch {
+      return c.json({ error: 'not_found' }, 404)
+    }
+  })
+  .get('/conversations/:id/messages', zValidator('query', z.object({ limit: z.string().optional() })), async (c) => {
+    const id = c.req.param('id')
+    const limit = Number(c.req.valid('query').limit ?? 50)
+    const rows = await listMessages(id, { limit })
+    return c.json(rows)
+  })
+  .get('/conversations/:id/activity', async (c) => {
+    const rows = await listActivity(c.req.param('id'))
+    return c.json(rows)
+  })
+  .get('/approvals', async (c) => {
+    const status = c.req.query('status') ?? 'pending'
+    const rows = await listApprovals(c.get('organizationId'), { status })
+    return c.json(rows)
+  })
+  .route('/approvals', approvals)
+  .route('/conversations', notes)
+  .route('/conversations', reassign)
+  .route('/conversations', reply)
+  .route('/conversations', snooze)
+  .route('/conversations', resolve)
+
+export default app

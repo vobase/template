@@ -1,0 +1,169 @@
+{
+  "$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
+  "files": {
+    "ignoreUnknown": true,
+    "includes": [
+      "**",
+      "!**/drizzle",
+      "!**/.omc",
+      "!**/db/current.sql",
+      "!public",
+      "!src/components/ui",
+      "!src/components/ai-elements",
+      "!src/components/data-table",
+      "!src/routeTree.gen.ts"
+    ]
+  },
+  "plugins": [
+    "./.biome/plugins/no-dynamic-import.grit",
+    "./.biome/plugins/no-raw-sql-statement.grit",
+    "./.biome/plugins/no-require.grit"
+  ],
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 120
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "single",
+      "jsxQuoteStyle": "double",
+      "semicolons": "asNeeded",
+      "trailingCommas": "all",
+      "arrowParentheses": "always",
+      "bracketSpacing": true
+    }
+  },
+  "css": {
+    "parser": {
+      "tailwindDirectives": true
+    }
+  },
+  "linter": {
+    "enabled": true,
+    "domains": {
+      "drizzle": "recommended",
+      "project": "recommended",
+      "react": "recommended",
+      "test": "recommended",
+      "turborepo": "recommended"
+    },
+    "rules": {
+      "recommended": true,
+      "suspicious": {
+        "noExplicitAny": "error",
+        "noTsIgnore": "error",
+        "useAwait": "warn",
+        "noFocusedTests": "error"
+      },
+      "style": {
+        "noNonNullAssertion": "error",
+        "useImportType": "error",
+        "useNodejsImportProtocol": "error",
+        "useThrowOnlyError": "error",
+        "noDefaultExport": "error"
+      },
+      "complexity": {
+        "noBannedTypes": "off"
+      },
+      "correctness": {
+        "noUnusedImports": "error",
+        "noUnusedVariables": "error"
+      },
+      "nursery": {
+        "noFloatingPromises": "error",
+        "useSortedClasses": {
+          "level": "error",
+          "options": {
+            "functions": [
+              "cn",
+              "clsx",
+              "cva",
+              "tw"
+            ]
+          }
+        }
+      }
+    }
+  },
+  "assist": {
+    "enabled": true,
+    "actions": {
+      "source": {
+        "organizeImports": {
+          "level": "on",
+          "options": {
+            "groups": [
+              [
+                ":NODE:"
+              ],
+              [
+                ":BUN:"
+              ],
+              [
+                ":URL:",
+                ":PACKAGE:",
+                ":PACKAGE_WITH_PROTOCOL:"
+              ],
+              ":BLANK_LINE:",
+              [
+                "#*",
+                "#*/**",
+                ":ALIAS:"
+              ],
+              [
+                ":PATH:"
+              ]
+            ]
+          }
+        }
+      }
+    }
+  },
+  "overrides": [
+    {
+      "includes": [
+        "**/*.css"
+      ],
+      "linter": {
+        "enabled": false
+      }
+    },
+    {
+      "includes": [
+        "src/**",
+        "modules/**/pages/**",
+        "modules/**/components/**",
+        "modules/**/hooks/**"
+      ],
+      "plugins": [
+        "./.biome/plugins/no-raw-fetch.grit"
+      ]
+    },
+    {
+      "includes": [
+        "**/routes/**",
+        "**/*.config.ts",
+        "**/handlers/**",
+        "**/pages/**",
+        "**/modules/**/module.ts",
+        "**/modules/**/seed.ts",
+        "**/server.ts",
+        "**/server/**/module.ts"
+      ],
+      "linter": {
+        "rules": {
+          "style": {
+            "noDefaultExport": "off"
+          }
+        }
+      }
+    }
+  ]
+}
