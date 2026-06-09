@@ -1,0 +1,366 @@
+/**
+ * Staff-reply dispatcher for the notification-channel inbound webhook.
+ *
+ * The platform-managed notification number forwards a staff member's WhatsApp
+ * reply here. Sub-branches (in order):
+ *   0. decision-route — the inbound is a button tap (`interactive.button_reply`
+ *      with `id = 'approve:<refId>' | 'deny:<refId>'`) OR a free-text reply
+ *      starting with `approve` / `deny` / `yes` / `no` / ✅ / ❌. When a live
+ *      ping resolves AND the claimed ping's `kind` is `'approval'` or
+ *      `'proposal'`, we route through `resolveReply` which calls
+ *      `pendingApprovals.decide` / `proposals.decideChangeProposal`. The decide
+ *      path emits `approval_decided` / `proposal_decided` so the wake chain
+ *      fires automatically — no separate addNote.
+ *   A. ask-staff-answer — a quote-reply (`context.id`) resolves to a pending
+ *      mention ping by exact wamid match. Appends a staff-authored internal
+ *      note carrying `mentions: ['agent:<askingAgentId>']`; the existing
+ *      `addNote` post-commit fan-out enqueues a wake for the asking agent.
+ *      A plain text reply never reaches this branch — it is not a quote, so it
+ *      claims no ping and falls through to the operator thread (Branch B).
+ *   B. operator-thread — no single ping resolved: enqueue/append into the
+ *      operator chat thread. A NEW thread's agent is resolved by priority:
+ *      the notification channel's `defaultAssignee` (set on /channels) → the
+ *      `getOrgSetting('defaultOperatorAgentId')` org default → the oldest
+ *      enabled agent. When the claim was `ambiguous` (the staff member has ≥2
+ *      live pings and didn't quote one), a `system` message is appended telling
+ *      the operator agent the reply could not be auto-routed.
+ */
+
+import { authUser } from '@auth/schema'
+import { agentDefinitions, operatorThreads } from '@modules/agents/schema'
+import { requireJobs } from '@modules/agents/service/state'
+import { threads as threadsApi } from '@modules/agents/service/threads'
+import { findNotificationChannel } from '@modules/channels/service/instances'
+import { internalNotes } from '@modules/messaging/schema'
+import { addNote } from '@modules/messaging/service/notes'
+import { getOrgSetting } from '@modules/settings/service/org-settings'
+import { staffProfiles } from '@modules/team/schema'
+import { matchButtonPayload } from '@modules/team/service/button-payload-matcher'
+import { claimPing } from '@modules/team/service/pending-staff-pings'
+import { parseReplyText } from '@modules/team/service/reply-parser'
+import { type PingKind, resolveReply } from '@modules/team/service/staff-ping'
+import { logger } from '@vobase/core'
+import { and, asc, desc, eq } from 'drizzle-orm'
+
+import type { ScopedDb } from '~/runtime'
+import { OPERATOR_THREAD_TO_WAKE_JOB } from '~/wake/operator-thread'
+
+interface MetaInboundMessage {
+  from?: string
+  type?: string
+  id?: string
+  text?: { body?: string }
+  /** Interactive payload — present when the staff member taps a button on a `vobase_decision_required_v2` template. */
+  interactive?: { button_reply?: { id?: string; title?: string }; type?: string }
+  /** Present only when the sender used WhatsApp's native reply gesture; `id` is the quoted message's wamid. */
+  context?: { id?: string }
+}
+
+export interface MetaInbound {
+  object?: string
+  entry?: Array<{
+    changes?: Array<{
+      value?: {
+        metadata?: { phone_number_id?: string }
+        messages?: MetaInboundMessage[]
+      }
+    }>
+  }>
+}
+
+export interface StaffReplyInput {
+  db: ScopedDb
+  organizationId: string
+  payload: MetaInbound
+}
+
+export interface StaffReplyResult {
+  ok: true
+  branch:
+    | 'unparseable'
+    | 'unmatched_staff'
+    | 'decision_routed'
+    | 'ask_staff_answer'
+    | 'operator_thread'
+    | 'operator_thread_ambiguous'
+    | 'no_enabled_agent'
+  threadId?: string
+  agentId?: string
+  warning?: string
+  decisionKind?: PingKind
+  decision?: 'approve' | 'deny'
+}
+
+/**
+ * Operator-agent-facing hint when a staff member quote-replied a notification
+ * whose ping no longer exists (claimed already, or aged past the 30-min TTL).
+ * The reply is likely an answer to that expired question — flag it so the
+ * operator agent confirms intent before acting on a possibly-stale decision.
+ */
+function buildStaleQuoteHint(): string {
+  return (
+    'Heads up: this teammate quote-replied a notification whose question has already expired or been answered. ' +
+    'This message may be a late answer to that earlier question rather than a fresh request — confirm what they ' +
+    'mean before acting on it, especially if it reads like a decision (an approval, a refund, a policy exception).'
+  )
+}
+
+/** Operator-agent-facing note when a reply couldn't be auto-routed to a consult. */
+function buildAmbiguousReplyHint(liveCount: number): string {
+  return (
+    `Heads up: this teammate has ${liveCount} open questions from agents waiting on a reply, and this message arrived ` +
+    'without quoting a specific one — so it could not be routed back to a conversation automatically. If it reads like ' +
+    'an answer to one of those, ask which customer or conversation they mean before relaying it. They can also ' +
+    'long-press a question in WhatsApp and reply to it directly so future answers route on their own.'
+  )
+}
+
+/**
+ * The @-mention used to thread a staff WhatsApp reply back into the
+ * conversation: the author of the note that triggered this ping — an agent or
+ * a staff member. Agent authors re-wake via the body-driven staff-note
+ * fan-out; staff authors get a visible threaded mention. Falls back to the
+ * ping's asking agent when the note row or its author cannot be resolved.
+ */
+async function resolveNoteAuthorMention(
+  db: ScopedDb,
+  organizationId: string,
+  originalNoteId: string,
+  fallbackAgentId: string,
+): Promise<{ name: string; token: string } | null> {
+  const [note] = await db
+    .select({ authorType: internalNotes.authorType, authorId: internalNotes.authorId })
+    .from(internalNotes)
+    .where(and(eq(internalNotes.id, originalNoteId), eq(internalNotes.organizationId, organizationId)))
+    .limit(1)
+
+  if (note?.authorType === 'staff' && note.authorId) {
+    const [staff] = await db
+      .select({ displayName: staffProfiles.displayName })
+      .from(staffProfiles)
+      .where(and(eq(staffProfiles.userId, note.authorId), eq(staffProfiles.organizationId, organizationId)))
+      .limit(1)
+    if (staff?.displayName) return { name: staff.displayName, token: `staff:${note.authorId}` }
+  }
+
+  const agentId = note?.authorType === 'agent' && note.authorId ? note.authorId : fallbackAgentId
+  const [agent] = await db
+    .select({ name: agentDefinitions.name })
+    .from(agentDefinitions)
+    .where(and(eq(agentDefinitions.id, agentId), eq(agentDefinitions.organizationId, organizationId)))
+    .limit(1)
+  return agent?.name ? { name: agent.name, token: `agent:${agentId}` } : null
+}
+
+export async function dispatchStaffReply(input: StaffReplyInput): Promise<StaffReplyResult> {
+  const { db, organizationId, payload } = input
+  const messages = payload.entry?.[0]?.changes?.[0]?.value?.messages ?? []
+  // Pick the first inbound that's either a text body OR an interactive
+  // button reply — both shapes carry an approve/deny signal.
+  const msg = messages.find(
+    (m) => (m.type === 'text' && m.text?.body) || (m.type === 'interactive' && m.interactive?.button_reply?.id),
+  )
+  if (!msg) return { ok: true, branch: 'unparseable' } // status-update or non-text/non-interactive
+
+  const senderPhone = msg.from
+  if (!senderPhone) return { ok: true, branch: 'unparseable' }
+
+  const buttonMatch = msg.interactive?.button_reply ? matchButtonPayload(msg.interactive.button_reply) : null
+  const text = msg.text?.body?.trim()
+  if (!buttonMatch && !text) return { ok: true, branch: 'unparseable' }
+
+  // Match either with or without leading `+` — Meta's wa_id has no `+`; we
+  // store `+E.164` on the better-auth `user` row.
+  const candidate = senderPhone.startsWith('+') ? senderPhone : `+${senderPhone}`
+  const [staff] = await db
+    .select({ userId: staffProfiles.userId })
+    .from(staffProfiles)
+    .innerJoin(authUser, eq(authUser.id, staffProfiles.userId))
+    .where(
+      and(
+        eq(staffProfiles.organizationId, organizationId),
+        eq(authUser.phoneNumber, candidate),
+        // Receive-side gating mirrors the send side: an unverified (or
+        // typo'd) number must not have a stranger's WhatsApp replies authored
+        // as this staff member's internal notes.
+        eq(authUser.phoneNumberVerified, true),
+      ),
+    )
+    .limit(1)
+  if (!staff) return { ok: true, branch: 'unmatched_staff' }
+
+  // ─── Branch A — ask-staff-answer ─────────────────────────────────────────
+  // A ping is claimed only by an exact `context.id` wamid match (a quote-reply)
+  // or a button tap. A plain text reply never claims a ping — `allowCountAware`
+  // is false for it, so it falls through to an operator thread (Branch B).
+  // Buttons carry no `context.id`, so they rely on the count-aware rung.
+  const claim = await claimPing({
+    staffUserId: staff.userId,
+    organizationId,
+    outboundWamid: msg.context?.id,
+    allowCountAware: Boolean(buttonMatch),
+  })
+
+  // ─── Branch 0 — decision-route ───────────────────────────────────────────
+  // Triggered when (a) the inbound carries a decision signal (button match or
+  // approve/deny verb) AND (b) a single live ping resolved AND (c) that ping's
+  // `kind` is 'approval' or 'proposal'. Mention pings fall through to Branch A
+  // because the agent wake happens via the staff-note fan-out, not a direct
+  // decide() call.
+  if (claim.status === 'claimed' && (claim.ping.kind === 'approval' || claim.ping.kind === 'proposal')) {
+    const parsed = buttonMatch
+      ? { decision: buttonMatch.decision, note: undefined as string | undefined, referenceId: buttonMatch.referenceId }
+      : text
+        ? { ...parseReplyText(text), referenceId: claim.ping.referenceId ?? claim.ping.originalNoteId }
+        : null
+    if (parsed && parsed.decision !== 'unknown') {
+      try {
+        await resolveReply(
+          claim.ping.kind as PingKind,
+          { decision: parsed.decision, note: parsed.note, referenceId: parsed.referenceId },
+          { staffUserId: staff.userId, conversationId: claim.ping.conversationId, organizationId },
+        )
+        return {
+          ok: true,
+          branch: 'decision_routed',
+          decisionKind: claim.ping.kind as PingKind,
+          decision: parsed.decision,
+        }
+      } catch (err) {
+        logger.warn({ err }, '[staff-reply-dispatch] decision_route resolveReply failed')
+        // Fall through to operator-thread so the staff reply isn't lost.
+      }
+    }
+  }
+
+  if (claim.status === 'claimed') {
+    const { ping } = claim
+    // The staff-note fan-out is body-driven (`resolveAgentMentionsInBody` scans
+    // for `@Name`), so the original note's author only re-engages if their
+    // handle is in the body — a bare WhatsApp reply has none. Prepend it,
+    // mirroring an inbox @-mention and threading the reply back to the asker.
+    const mention = await resolveNoteAuthorMention(db, organizationId, ping.originalNoteId, ping.askingAgentId)
+    const noteBody = mention ? `@${mention.name} ${text ?? ''}`.trim() : (text ?? '')
+    try {
+      await addNote({
+        organizationId,
+        conversationId: ping.conversationId,
+        author: { kind: 'staff', id: staff.userId },
+        body: noteBody,
+        mentions: mention ? [mention.token] : [`agent:${ping.askingAgentId}`],
+        parentNoteId: ping.originalNoteId,
+      })
+      return { ok: true, branch: 'ask_staff_answer' }
+    } catch (err) {
+      logger.warn({ err }, '[staff-reply-dispatch] ask_staff_answer addNote failed')
+      return { ok: true, branch: 'ask_staff_answer', warning: 'addNote_failed' }
+    }
+  }
+
+  // ─── Branch B — operator-thread ──────────────────────────────────────────
+  // Reached when the claim was `none` (a fresh staff-initiated message) or
+  // `ambiguous` (≥2 live pings, no quoted wamid — we refuse to guess which
+  // conversation the reply answers; the operator agent gets a `system` hint).
+  const ambiguousCount = claim.status === 'ambiguous' ? claim.liveCount : null
+  // A quote-reply (`context.id` present) that resolved no ping means the
+  // quoted notification's ping expired or was already claimed.
+  const staleQuote = claim.status === 'none' && Boolean(msg.context?.id)
+  // Resolve the operator-thread agent. Priority:
+  //   1. The notification channel's `defaultAssignee` (the agent an operator
+  //      picks on the /channels page) — when it names an agent that still
+  //      exists and is enabled in this org.
+  //   2. The org's `defaultOperatorAgentId` setting.
+  //   3. The oldest enabled agent.
+  let agentId: string | null = null
+  const notifChannel = await findNotificationChannel(organizationId)
+  const assigneeToken =
+    typeof notifChannel?.config?.defaultAssignee === 'string' ? notifChannel.config.defaultAssignee : null
+  const assigneeAgentId = assigneeToken?.startsWith('agent:') ? assigneeToken.slice('agent:'.length) : null
+  if (assigneeAgentId) {
+    // Validate the configured assignee still resolves to a live agent — a
+    // stale `defaultAssignee` (agent deleted/disabled) must fall through
+    // rather than create a thread whose wake can never run.
+    const [row] = await db
+      .select({ id: agentDefinitions.id })
+      .from(agentDefinitions)
+      .where(
+        and(
+          eq(agentDefinitions.id, assigneeAgentId),
+          eq(agentDefinitions.organizationId, organizationId),
+          eq(agentDefinitions.enabled, true),
+        ),
+      )
+      .limit(1)
+    agentId = row?.id ?? null
+  }
+  if (!agentId) agentId = await getOrgSetting(organizationId, 'defaultOperatorAgentId')
+  if (!agentId) {
+    const [first] = await db
+      .select({ id: agentDefinitions.id })
+      .from(agentDefinitions)
+      .where(and(eq(agentDefinitions.organizationId, organizationId), eq(agentDefinitions.enabled, true)))
+      .orderBy(asc(agentDefinitions.createdAt))
+      .limit(1)
+    agentId = first?.id ?? null
+  }
+  if (!agentId) return { ok: true, branch: 'no_enabled_agent' }
+
+  const [existingThread] = await db
+    .select({ id: operatorThreads.id, agentId: operatorThreads.agentId })
+    .from(operatorThreads)
+    .where(
+      and(
+        eq(operatorThreads.organizationId, organizationId),
+        eq(operatorThreads.createdBy, staff.userId),
+        eq(operatorThreads.status, 'open'),
+      ),
+    )
+    .orderBy(desc(operatorThreads.updatedAt))
+    .limit(1)
+
+  // Button-only inbounds (interactive without text) get a synthesised body so
+  // the operator agent has SOMETHING to read.
+  const operatorThreadBody =
+    text ?? `[button] ${msg.interactive?.button_reply?.title ?? msg.interactive?.button_reply?.id ?? 'unknown'}`
+
+  let threadId: string
+  let threadAgentId: string
+  if (existingThread) {
+    threadId = existingThread.id
+    threadAgentId = existingThread.agentId
+    await threadsApi.appendMessage({ threadId, role: 'user', content: operatorThreadBody })
+  } else {
+    const created = await threadsApi.createThread({
+      organizationId,
+      agentId,
+      createdBy: staff.userId,
+      title: 'WhatsApp thread',
+      firstMessage: { role: 'user', content: operatorThreadBody },
+    })
+    threadId = created.threadId
+    threadAgentId = agentId
+  }
+
+  if (ambiguousCount !== null) {
+    await threadsApi.appendMessage({
+      threadId,
+      role: 'system',
+      content: buildAmbiguousReplyHint(ambiguousCount),
+    })
+  } else if (staleQuote) {
+    await threadsApi.appendMessage({ threadId, role: 'system', content: buildStaleQuoteHint() })
+  }
+
+  await requireJobs().send(
+    OPERATOR_THREAD_TO_WAKE_JOB,
+    { organizationId, threadId },
+    { singletonKey: `operator-thread:${threadId}` },
+  )
+
+  return {
+    ok: true,
+    branch: ambiguousCount === null ? 'operator_thread' : 'operator_thread_ambiguous',
+    threadId,
+    agentId: threadAgentId,
+  }
+}

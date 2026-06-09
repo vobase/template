@@ -1,0 +1,406 @@
+/**
+ * Staff-link reconciler — converges tenant-side staff phone numbers (the
+ * better-auth `user.phone_number`, surfaced on `StaffProfile.phoneNumber`)
+ * with the platform's `staff_links` registry for the org's notification-tier
+ * WhatsApp channel.
+ *
+ * Per §4.3 of the platform-tenant decoupling spec, this is the *single*
+ * reconciler that owns the staff-link write path tenant-side. The PATCH
+ * staff-phone handler does not call `staffLinks.upsert` inline — it enqueues
+ * a `team:sync-staff-link` pg-boss job which calls `syncStaffLinks` here.
+ * A daily cron also enqueues per-org sync to catch drift (deleted users,
+ * platform-side resets, mid-flight 5xx that exhausted retries).
+ *
+ * Idempotent. Out-of-order PATCH bursts converge: the reconciler diffs
+ * tenant set vs platform set and applies only the delta. Re-running on
+ * a converged org is a single GET + no writes.
+ *
+ * Per §7.6 R9-E, the pg-boss enqueue side uses `singletonKey: staff-link-sync:<orgId>`
+ * + `singletonHours: 0.0167` (1 minute) so a burst of PATCHes coalesces to
+ * ≤1 in-flight job per org per minute (rate-limit ≤5/min/org).
+ */
+/** @contract platform-tenant-v1 — invoked by team:sync-staff-link pg-boss job. */
+
+import type { ChannelInstance } from '@modules/channels/schema'
+import { findNotificationChannel } from '@modules/channels/service/instances'
+import {
+  staffLinks as defaultStaffLinks,
+  PlatformHandshakeError,
+  type StaffLinkRow,
+} from '@modules/integrations/service/handshake'
+import { normalizeWaId } from '@modules/integrations/service/phone'
+
+import type { ScopedDb } from '~/runtime'
+import type { StaffProfile } from '../schema'
+import { list as listStaff } from './staff'
+
+export const SYNC_STAFF_LINK_JOB = 'team:sync-staff-link'
+export const SYNC_STAFF_LINK_CRON_JOB = 'team:sync-staff-link:cron'
+/** 1 minute coalescing window (singletonHours is fractional hours). */
+export const SYNC_STAFF_LINK_SINGLETON_HOURS = 1 / 60
+/** Daily reconcile at 03:00 UTC. */
+export const SYNC_STAFF_LINK_CRON = '0 3 * * *'
+/** Per §7.6: 7 retries, ~24h horizon (exponential backoff handles the spread). */
+export const SYNC_STAFF_LINK_RETRY_LIMIT = 7
+
+export interface SyncStaffLinkError {
+  phase: 'upsert' | 'delete' | 'list'
+  /** E.164 with leading `+` for upsert/delete; empty string for list. */
+  staffPhoneE164: string
+  message: string
+}
+
+export interface PlatformCreds {
+  platformBaseUrl: string
+  tenantId: string
+  tenantHmacSecret: string
+  environment: 'production' | 'staging'
+}
+
+export interface StaffLinksApi {
+  list: (input: {
+    platformBaseUrl: string
+    tenantId: string
+    tenantHmacSecret: string
+    channelInstanceId?: string
+  }) => Promise<StaffLinkRow[]>
+  upsert: (input: {
+    platformBaseUrl: string
+    tenantId: string
+    tenantHmacSecret: string
+    environment: 'production' | 'staging'
+    channelInstanceId: string
+    staffUserId: string
+    staffPhoneE164: string
+  }) => Promise<{ linked: true; staffPhoneE164: string }>
+  delete: (input: {
+    platformBaseUrl: string
+    tenantId: string
+    tenantHmacSecret: string
+    environment: 'production' | 'staging'
+    staffPhoneE164: string
+  }) => Promise<{ removed: boolean }>
+}
+
+export interface SyncStaffLinksOptions {
+  /** ScopedDb for `findNotificationChannel`. Required outside test injection. */
+  db?: ScopedDb
+  /**
+   * Platform credentials. Required at production call-sites (cron + enqueue);
+   * optional in tests where `staffLinksApi` is injected to bypass the platform.
+   */
+  creds?: PlatformCreds
+  /** When true, compute the delta + log it but skip write calls. */
+  dryRun?: boolean
+  // ─── Injection points (used by unit + integration tests) ──────────────────
+  /** List staff for an org. Defaults to the installed staff service. */
+  listStaff?: (orgId: string) => Promise<StaffProfile[]>
+  /** Resolve the org's notification-tier WhatsApp channel row. */
+  getNotificationChannel?: (orgId: string) => Promise<ChannelInstance | null>
+  /** Platform staff-link CRUD. Defaults to the env-bound handshake helpers. */
+  staffLinksApi?: StaffLinksApi
+  /** Override the env-based platform-creds reader (tests). */
+  readPlatformCreds?: () => PlatformCreds | null
+}
+
+export type SyncStaffLinksResult =
+  | { kind: 'skipped'; orgId: string; reason: 'no_notification_channel' | 'platform_not_configured' }
+  | {
+      kind: 'applied'
+      orgId: string
+      toUpsert: number
+      toDelete: number
+      applied: { upserted: number; deleted: number }
+      errors: SyncStaffLinkError[]
+    }
+
+function defaultReadPlatformCreds(): PlatformCreds | null {
+  const platformBaseUrl = process.env.VITE_PLATFORM_URL ?? ''
+  // X-Tenant-Id = tenants.id (nanoid), not the slug — see PLATFORM_TENANT_ID
+  // provisioning at modules/provisioning/jobs.ts in vobase-platform.
+  const tenantId = process.env.PLATFORM_TENANT_ID ?? ''
+  const tenantHmacSecret = process.env.PLATFORM_HMAC_SECRET ?? ''
+  // `STAGING`, not `NODE_ENV`, is the env discriminator: the Dockerfile pins
+  // `NODE_ENV=production` in every tenant container, so `NODE_ENV` cannot tell
+  // production from staging — and is unset in local dev. This MUST match the
+  // notification-channel claim in `channels/.../managed.ts`, or the synced
+  // staff-links scope to a `mgd-<org>-<env>-notif` id the channel never used.
+  const environment: 'production' | 'staging' = process.env.STAGING === 'true' ? 'staging' : 'production'
+  if (!platformBaseUrl || !tenantId || !tenantHmacSecret) return null
+  return { platformBaseUrl, tenantId, tenantHmacSecret, environment }
+}
+
+/**
+ * Per-org platform-side identifier used to scope `staff_links` rows. Mirrors
+ * the deterministic channel-instance id format that `claimAndBootstrap`
+ * synthesized for the notification tier (`mgd-<orgId>-<env>-notif`), so the
+ * platform-side rows seeded under the old shape stay addressable post-cutover.
+ */
+function notificationChannelInstanceId(orgId: string, environment: 'production' | 'staging'): string {
+  return `mgd-${orgId}-${environment}-notif`
+}
+
+/**
+ * Compute the per-org delta between tenant-side staff (those with a non-null
+ * `phoneNumber`) and platform-side `staff_links`, then apply via
+ * `staffLinks.upsert` / `staffLinks.delete` until they converge.
+ *
+ * Out-of-order safe: the reconciler diffs sets, so two PATCHes racing each
+ * other still converge once the loser's enqueue eventually fires. Per-row
+ * errors accumulate in `result.errors` and do not abort the rest of the
+ * walk — partial progress is committed and the job retries the remainder.
+ */
+export async function syncStaffLinks(
+  orgId: string,
+  options: SyncStaffLinksOptions = {},
+): Promise<SyncStaffLinksResult> {
+  const listStaffFn = options.listStaff ?? listStaff
+  const getChannelFn =
+    options.getNotificationChannel ??
+    ((id: string) => {
+      if (!options.db)
+        throw new Error('syncStaffLinks: options.db required when getNotificationChannel is not injected')
+      return findNotificationChannel(id)
+    })
+  const api = options.staffLinksApi ?? defaultStaffLinks
+  const readCreds = options.readPlatformCreds ?? defaultReadPlatformCreds
+
+  const errors: SyncStaffLinkError[] = []
+
+  const channel = await getChannelFn(orgId)
+  if (!channel) {
+    return { kind: 'skipped', orgId, reason: 'no_notification_channel' }
+  }
+
+  const creds = options.creds ?? readCreds()
+  if (!creds) {
+    return { kind: 'skipped', orgId, reason: 'platform_not_configured' }
+  }
+
+  const channelInstanceId = notificationChannelInstanceId(orgId, creds.environment)
+
+  // Tenant-side: staff with a populated WhatsApp phone. Normalize once so
+  // the diff compares canonical wa_ids (no leading `+`, no whitespace) on
+  // both sides — matches what the platform stores.
+  const staff = await listStaffFn(orgId)
+  const tenantByWaId = new Map<string, { userId: string; staffPhoneE164: string }>()
+  for (const profile of staff) {
+    if (!profile.phoneNumber) continue
+    try {
+      const waId = normalizeWaId(profile.phoneNumber)
+      tenantByWaId.set(waId, { userId: profile.userId, staffPhoneE164: profile.phoneNumber })
+    } catch (err) {
+      // Malformed phone in the DB — surface as a per-row error and skip.
+      errors.push({
+        phase: 'upsert',
+        staffPhoneE164: profile.phoneNumber,
+        message: err instanceof Error ? err.message : 'invalid wa_id',
+      })
+    }
+  }
+
+  // Platform-side: the channel's existing staff_links. List failure aborts
+  // the run with a single error — there's no point trying to diff against
+  // an unknown set.
+  let platformLinks: StaffLinkRow[]
+  try {
+    platformLinks = await api.list({
+      platformBaseUrl: creds.platformBaseUrl,
+      tenantId: creds.tenantId,
+      tenantHmacSecret: creds.tenantHmacSecret,
+      channelInstanceId,
+    })
+  } catch (err) {
+    errors.push({
+      phase: 'list',
+      staffPhoneE164: '',
+      message: err instanceof Error ? err.message : 'list failed',
+    })
+    return {
+      kind: 'applied',
+      orgId,
+      toUpsert: 0,
+      toDelete: 0,
+      applied: { upserted: 0, deleted: 0 },
+      errors,
+    }
+  }
+
+  const platformByWaId = new Map<string, StaffLinkRow>()
+  for (const row of platformLinks) {
+    // The platform stores wa_id (no `+`); normalize defensively so a row
+    // stored as `+E164` (legacy) compares equal to the wa_id form.
+    try {
+      const waId = normalizeWaId(row.staffPhoneE164)
+      platformByWaId.set(waId, row)
+    } catch {
+      // Unparseable platform-side row — surface and skip.
+      errors.push({
+        phase: 'delete',
+        staffPhoneE164: row.staffPhoneE164,
+        message: 'platform returned unparseable staff_phone_e164',
+      })
+    }
+  }
+
+  // Upserts: tenant has a phone the platform doesn't, OR the platform has
+  // the phone bound to a different `staffUserId` (re-bind after a staff
+  // swap on the same number).
+  const upserts: Array<{ userId: string; staffPhoneE164: string }> = []
+  for (const [waId, tenant] of tenantByWaId) {
+    const platformRow = platformByWaId.get(waId)
+    if (!platformRow || platformRow.staffUserId !== tenant.userId) {
+      upserts.push(tenant)
+    }
+  }
+
+  // Deletes: platform has a phone that isn't in the tenant set.
+  const deletes: StaffLinkRow[] = []
+  for (const [waId, row] of platformByWaId) {
+    if (!tenantByWaId.has(waId)) deletes.push(row)
+  }
+
+  if (options.dryRun) {
+    return {
+      kind: 'applied',
+      orgId,
+      toUpsert: upserts.length,
+      toDelete: deletes.length,
+      applied: { upserted: 0, deleted: 0 },
+      errors,
+    }
+  }
+
+  // Apply upserts + deletes in parallel — they target the same platform
+  // endpoint, but the platform stays behind the per-job singleton-rate-limit
+  // (R9-E) so worst-case fanout is bounded by job concurrency.
+  const [upsertOutcomes, deleteOutcomes] = await Promise.all([
+    Promise.all(
+      upserts.map((u) =>
+        api
+          .upsert({
+            platformBaseUrl: creds.platformBaseUrl,
+            tenantId: creds.tenantId,
+            tenantHmacSecret: creds.tenantHmacSecret,
+            environment: creds.environment,
+            channelInstanceId,
+            staffUserId: u.userId,
+            staffPhoneE164: u.staffPhoneE164,
+          })
+          .then(() => ({ ok: true as const }))
+          .catch((err: unknown) => ({ ok: false as const, err, row: u })),
+      ),
+    ),
+    Promise.all(
+      deletes.map((d) =>
+        api
+          .delete({
+            platformBaseUrl: creds.platformBaseUrl,
+            tenantId: creds.tenantId,
+            tenantHmacSecret: creds.tenantHmacSecret,
+            environment: creds.environment,
+            // Platform-stored value may be either form; pass through as-is so the
+            // delete helper's own `toWaId` normalization stays the single source.
+            staffPhoneE164: d.staffPhoneE164,
+          })
+          .then(() => ({ ok: true as const }))
+          .catch((err: unknown) => ({ ok: false as const, err, row: d })),
+      ),
+    ),
+  ])
+
+  let upserted = 0
+  for (let i = 0; i < upsertOutcomes.length; i += 1) {
+    const outcome = upsertOutcomes[i]
+    if (!outcome) continue
+    if (outcome.ok) {
+      upserted += 1
+    } else {
+      const u = outcome.row
+      errors.push({
+        phase: 'upsert',
+        staffPhoneE164: u.staffPhoneE164,
+        message:
+          outcome.err instanceof PlatformHandshakeError
+            ? outcome.err.message
+            : outcome.err instanceof Error
+              ? outcome.err.message
+              : 'upsert failed',
+      })
+    }
+  }
+
+  let deleted = 0
+  for (let i = 0; i < deleteOutcomes.length; i += 1) {
+    const outcome = deleteOutcomes[i]
+    if (!outcome) continue
+    if (outcome.ok) {
+      deleted += 1
+    } else {
+      const d = outcome.row
+      errors.push({
+        phase: 'delete',
+        staffPhoneE164: d.staffPhoneE164,
+        message:
+          outcome.err instanceof PlatformHandshakeError
+            ? outcome.err.message
+            : outcome.err instanceof Error
+              ? outcome.err.message
+              : 'delete failed',
+      })
+    }
+  }
+
+  return {
+    kind: 'applied',
+    orgId,
+    toUpsert: upserts.length,
+    toDelete: deletes.length,
+    applied: { upserted, deleted },
+    errors,
+  }
+}
+
+// ─── Enqueue (job side) ─────────────────────────────────────────────────────
+
+export interface SyncStaffLinkJobQueue {
+  send(name: string, data: unknown, opts?: { singletonKey?: string; singletonHours?: number }): Promise<string>
+}
+
+interface TeamJobsState {
+  jobs: SyncStaffLinkJobQueue | null
+}
+
+let _state: TeamJobsState = { jobs: null }
+
+export function installTeamJobsState(state: TeamJobsState): void {
+  _state = state
+}
+
+export function __resetTeamJobsStateForTests(): void {
+  _state = { jobs: null }
+}
+
+/**
+ * Enqueue a deduped reconcile for `orgId`. Per §7.6 R9-E, pg-boss
+ * `singletonKey` coalesces enqueues by `(name, key)` and the upstream
+ * scheduler is expected to apply `singletonHours` to rate-limit fanout.
+ * A burst of PATCHes from the same org therefore collapses to ≤1 job/min.
+ */
+export async function syncStaffLinksEnqueue(orgId: string): Promise<void> {
+  if (!_state.jobs) {
+    // Tests / boot order without an installed scheduler: silently no-op.
+    // The PATCH path tolerates this — the daily cron + next PATCH will
+    // eventually converge. A loud throw here would break unit tests that
+    // exercise PATCH without booting the full module ctx.
+    return
+  }
+  await _state.jobs.send(
+    SYNC_STAFF_LINK_JOB,
+    { orgId },
+    {
+      singletonKey: `staff-link-sync:${orgId}`,
+      singletonHours: SYNC_STAFF_LINK_SINGLETON_HOURS,
+    },
+  )
+}

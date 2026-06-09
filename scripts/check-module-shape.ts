@@ -1,0 +1,614 @@
+#!/usr/bin/env bun
+/**
+ * CI lint — module shape invariants.
+ *
+ * Two layers:
+ *
+ * 1. Journal write-path guard (static grep). `messages` / `conversation_events`
+ *    are write-once-path tables — only `modules/messaging/service/**` may
+ *    `.insert/update/delete()` them. Cross-module callers route through the
+ *    typed `appendJournalEvent` wrapper exported from
+ *    `modules/messaging/service/journal.ts`. Prevents the dual-write class of
+ *    bugs.
+ *
+ * 2. Module contract invariants — enforce the declarative-module-collector
+ *    contract (Slice 4b). Loaded by importing `runtime/modules.ts`:
+ *      - `agent.tools[i].name` unique across modules
+ *      - `agent.commands[i].name` unique across modules
+ *      - `jobs[i].name` unique across modules (excluding `disabled: true`)
+ *      - Every `agent.listeners[slot][i]` is a function
+ *      - Every `agent.materializers[i].path` is an absolute workspace path
+ *      - Every `agent.materializers[i].phase` is one of the known enum values
+ *      - `module.ts` contains no inline `tools: [...]` / `listeners: {...}` /
+ *        `materializers: [...]` / `commands: [...]` / `sideLoad: [...]` literals
+ *        at the `ModuleDef` level
+ *      - `module.ts` contains no `ctx.register*` calls
+ *
+ * Tolerant of the partial-migration state: a module whose `agent` / `jobs`
+ * surface is undefined skips the corresponding dynamic check.
+ */
+
+import { join } from 'node:path'
+
+import { modules as registeredModules } from '../runtime/modules'
+
+const TEMPLATE_ROOT = join(import.meta.dir, '..')
+const MODULES_DIR = join(TEMPLATE_ROOT, 'modules')
+
+interface LintError {
+  file: string
+  line?: number
+  message: string
+}
+
+const errors: LintError[] = []
+
+const JOURNAL_WRITE_RE = /\.(insert|update|delete)\s*\(\s*(messages|conversationEvents)\b/
+const JOURNAL_WRITE_ALLOWED = ['modules/messaging/service/']
+
+const THREADS_WRITE_RE = /\.(insert|update|delete)\s*\(\s*(operatorThreads|operatorThreadMessages)\b/
+const THREADS_WRITE_ALLOWED = ['modules/agents/service/threads.ts']
+
+const _CHANGES_WRITE_RE = /\.(insert|update|delete)\s*\(\s*(changeProposals|changeHistory)\b/
+const _CHANGES_WRITE_ALLOWED = ['modules/changes/service/proposals.ts']
+
+const REACTIONS_WRITE_RE = /\.(insert|update|delete)\s*\(\s*messageReactions\b/
+const REACTIONS_WRITE_ALLOWED = ['modules/messaging/service/reactions.ts']
+
+const SESSIONS_WRITE_RE = /\.(insert|update|delete)\s*\(\s*conversationSessions\b/
+const SESSIONS_WRITE_ALLOWED = ['modules/messaging/service/sessions.ts']
+
+const SIGNUP_NONCES_WRITE_RE = /\.(insert|update|delete)\s*\(\s*signupNonces\b/
+const SIGNUP_NONCES_WRITE_ALLOWED = ['modules/channels/service/signup-nonces.ts']
+
+// Automations module sole-writer guards. Pattern mirrors
+// `JOURNAL_WRITE_RE`/`JOURNAL_WRITE_ALLOWED` above.
+
+const AUTOMATIONS_WRITE_RE = /\.(insert|update|delete)\s*\(\s*automations\b/
+const AUTOMATIONS_WRITE_ALLOWED = ['modules/automations/service/automations.ts', 'modules/automations/seed.ts']
+
+const AUTOMATION_RUNS_WRITE_RE = /\.(insert|update|delete)\s*\(\s*automationRuns\b/
+const AUTOMATION_RUNS_WRITE_ALLOWED = [
+  'modules/automations/service/dispatcher.ts',
+  // US-015 / Slice D.3 — admin-alert is a sole writer for its own sentinel
+  // event-name slice (`budget_watcher.admin_alert`); the dedup query reads
+  // from the same table the dispatcher writes to but admin-alert never
+  // touches dispatcher-owned rows.
+  'modules/automations/service/admin-alert.ts',
+  // US-015 / Slice D.3 — retention sweep DELETEs are tightly scoped to rows
+  // older than 30 days; pure function lives here, pg-boss handler in
+  // jobs.ts delegates.
+  'modules/automations/service/runs-prune.ts',
+]
+
+const TENANT_BUDGET_CAPS_WRITE_RE = /\.(insert|update|delete)\s*\(\s*tenantBudgetCaps\b/
+const TENANT_BUDGET_CAPS_WRITE_ALLOWED = ['modules/automations/service/budget-caps.ts']
+
+const STAFF_PINGS_WRITE_RE = /\.(insert|update|delete)\s*\(\s*pendingStaffPings\b/
+const STAFF_PINGS_WRITE_ALLOWED = ['modules/team/service/pending-staff-pings.ts']
+
+// `mintMagicLink` is a post-commit token issuance side effect (Principle 6 — plan §8a.1).
+// Only 3 files may import it; wake-trigger renderers and WorkspaceMaterializerFactory cannot,
+// to prevent agent-tool authors from accidentally minting magic-links inside a producer tx.
+// The regex matches only imports that name `mintMagicLink` specifically — other exports from
+// `auth/magic-link` (e.g. `magicLinkCaptor`, types) are not gated.
+const MINT_MAGIC_LINK_IMPORT_RE =
+  /import\s*\{[^}]*\bmintMagicLink\b[^}]*\}.*from\s+['"](?:@auth\/magic-link|.*\/auth\/magic-link)['"]/
+const MINT_MAGIC_LINK_ALLOWED = [
+  'modules/team/service/staff-ping.ts',
+  'modules/automations/service/admin-alert.ts',
+  'modules/automations/service/dispatcher.ts',
+]
+
+// US-016a / §8b.0 Item 1 — captor-helper import boundary.
+// `createCaptor` from `auth/captor-pattern` owns the dangerous pending-Map +
+// nonce-routing + timeout machinery that bridges synchronous better-auth send
+// callbacks back into our async mint flow. To keep the captor surface area
+// bounded (Principle 1 — captor abstraction before captor proliferation), only
+// the captor-consumer modules in `auth/` may instantiate one. Today that is
+// `auth/magic-link.ts`; US-017 adds `auth/phone-otp.ts`.
+const MINT_CAPTOR_HELPER_IMPORT_RE =
+  /import\s*\{[^}]*\bcreateCaptor\b[^}]*\}.*from\s+['"](?:@auth\/captor-pattern|.*\/auth\/captor-pattern|\.\/captor-pattern)['"]/
+const MINT_CAPTOR_HELPER_ALLOWED = [
+  'auth/magic-link.ts',
+  // US-017 reserves this slot; the file is added in the phone-OTP captor commit.
+  'auth/phone-otp.ts',
+]
+
+/**
+ * Pure import-boundary checker for `createCaptor` — exported for unit tests.
+ *
+ * @param relFromRoot - path relative to template root, e.g. `auth/foo.ts` or `modules/bar.ts`
+ * @param lines - file lines (without trailing newlines)
+ * @returns array of error messages; empty = clean
+ */
+export function lintCaptorHelperImports(relFromRoot: string, lines: readonly string[]): string[] {
+  if (MINT_CAPTOR_HELPER_ALLOWED.some((p) => relFromRoot === p)) return []
+  const errs: string[] = []
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    if (line.trimStart().startsWith('//') || line.trimStart().startsWith('*')) continue
+    if (MINT_CAPTOR_HELPER_IMPORT_RE.test(line)) {
+      errs.push(
+        `createCaptor import disallowed from ${relFromRoot}:${i + 1} — captor instantiation is restricted to auth/magic-link.ts and auth/phone-otp.ts (Principle 1 — captor abstraction before captor proliferation)`,
+      )
+    }
+  }
+  return errs
+}
+
+/**
+ * Pure import-boundary checker for `mintMagicLink` — exported for unit tests.
+ *
+ * @param relFromRoot - path relative to template root, e.g. `modules/foo/bar.ts` or `wake/trigger.ts`
+ * @param lines - file lines (without trailing newlines)
+ * @returns array of error messages; empty = clean
+ */
+export function lintMintMagicLinkImports(relFromRoot: string, lines: readonly string[]): string[] {
+  // Allowed files are modules-relative; wake/ is always forbidden.
+  if (MINT_MAGIC_LINK_ALLOWED.some((p) => relFromRoot === p)) return []
+  const errs: string[] = []
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    if (line.trimStart().startsWith('//') || line.trimStart().startsWith('*')) continue
+    if (MINT_MAGIC_LINK_IMPORT_RE.test(line)) {
+      errs.push(
+        `mintMagicLink import disallowed from ${relFromRoot}:${i + 1} — Principle 6 (token issuance never blocks the wake transaction); allowed in [modules/team/service/staff-ping.ts, modules/automations/service/admin-alert.ts, modules/automations/service/dispatcher.ts]`,
+      )
+    }
+  }
+  return errs
+}
+
+/**
+ * `learning_proposals` migration guard. After Slice C the table, schema, and
+ * service are deleted; any code-resurrection (typo, copy-paste, partial
+ * rebase) must fail the build.
+ */
+const LEARNING_RESIDUE_RE = /\b(learning_proposals|learningProposals)\b/
+
+async function checkJournalWriteAuthority(): Promise<void> {
+  const glob = new Bun.Glob('**/*.ts')
+  for await (const entry of glob.scan({ cwd: MODULES_DIR })) {
+    if (entry.endsWith('.test.ts') || entry.includes('__tests__/')) continue
+    const fullPath = join(MODULES_DIR, entry)
+    const relFromModules = `modules/${entry}`
+    const lines = (await Bun.file(fullPath).text()).split('\n')
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      if (line.trimStart().startsWith('//') || line.trimStart().startsWith('*')) continue
+      if (!JOURNAL_WRITE_ALLOWED.some((prefix) => relFromModules.startsWith(prefix))) {
+        const m = JOURNAL_WRITE_RE.exec(line)
+        if (m) {
+          errors.push({
+            file: fullPath,
+            line: i + 1,
+            message: `writes to "${m[2]}" only allowed in messaging/service or agents/service/journal.ts (one-write-path)`,
+          })
+        }
+      }
+      if (!THREADS_WRITE_ALLOWED.some((p) => relFromModules === p)) {
+        const m = THREADS_WRITE_RE.exec(line)
+        if (m) {
+          errors.push({
+            file: fullPath,
+            line: i + 1,
+            message: `writes to "${m[2]}" only allowed in modules/agents/service/threads.ts (one-write-path)`,
+          })
+        }
+      }
+      if (!REACTIONS_WRITE_ALLOWED.some((p) => relFromModules === p)) {
+        const m = REACTIONS_WRITE_RE.exec(line)
+        if (m) {
+          errors.push({
+            file: fullPath,
+            line: i + 1,
+            message: `writes to "${m[2]}" only allowed in messaging/service/reactions.ts (one-write-path)`,
+          })
+        }
+      }
+      if (!SESSIONS_WRITE_ALLOWED.some((p) => relFromModules === p)) {
+        const m = SESSIONS_WRITE_RE.exec(line)
+        if (m) {
+          errors.push({
+            file: fullPath,
+            line: i + 1,
+            message: `writes to "${m[2]}" only allowed in messaging/service/sessions.ts (one-write-path)`,
+          })
+        }
+      }
+      if (!SIGNUP_NONCES_WRITE_ALLOWED.some((p) => relFromModules === p)) {
+        const m = SIGNUP_NONCES_WRITE_RE.exec(line)
+        if (m) {
+          errors.push({
+            file: fullPath,
+            line: i + 1,
+            message: `writes to "${m[2]}" only allowed in channels/service/signup-nonces.ts (one-write-path)`,
+          })
+        }
+      }
+      if (!AUTOMATIONS_WRITE_ALLOWED.some((p) => relFromModules === p)) {
+        const m = AUTOMATIONS_WRITE_RE.exec(line)
+        if (m) {
+          errors.push({
+            file: fullPath,
+            line: i + 1,
+            message: `writes to "automations" only allowed in automations/service/automations.ts — route via pauseRule/resumeRule/createRule/updateRule wrappers (one-write-path)`,
+          })
+        }
+      }
+      if (!AUTOMATION_RUNS_WRITE_ALLOWED.some((p) => relFromModules === p)) {
+        const m = AUTOMATION_RUNS_WRITE_RE.exec(line)
+        if (m) {
+          errors.push({
+            file: fullPath,
+            line: i + 1,
+            message: `writes to "automationRuns" only allowed in automations/service/dispatcher.ts (one-write-path)`,
+          })
+        }
+      }
+      if (!TENANT_BUDGET_CAPS_WRITE_ALLOWED.some((p) => relFromModules === p)) {
+        const m = TENANT_BUDGET_CAPS_WRITE_RE.exec(line)
+        if (m) {
+          errors.push({
+            file: fullPath,
+            line: i + 1,
+            message: `writes to "tenantBudgetCaps" only allowed in automations/service/budget-caps.ts — route via setBudget wrapper (one-write-path)`,
+          })
+        }
+      }
+      if (!STAFF_PINGS_WRITE_ALLOWED.some((p) => relFromModules === p)) {
+        const m = STAFF_PINGS_WRITE_RE.exec(line)
+        if (m) {
+          errors.push({
+            file: fullPath,
+            line: i + 1,
+            message: `writes to "pendingStaffPings" only allowed in team/service/pending-staff-pings.ts (one-write-path)`,
+          })
+        }
+      }
+      const residue = LEARNING_RESIDUE_RE.exec(line)
+      if (residue) {
+        errors.push({
+          file: fullPath,
+          line: i + 1,
+          message: `forbidden reference to "${residue[1]}" — Slice C removed this table; use modules/changes (changeProposals / changeHistory) instead`,
+        })
+      }
+    }
+  }
+
+  // Second pass: scan wake/ for mintMagicLink import violations.
+  // wake/ is excluded from the modules/ scan above (different cwd) but must
+  // also be covered — wake-trigger renderers and lane builders run inside the
+  // producer transaction and must never issue tokens (Principle 6).
+  // Decision: keep a second Glob pass over wake/ rather than changing the scan
+  // root to TEMPLATE_ROOT, to avoid accidentally gating modules-only rules on
+  // auth/ or scripts/ files that legitimately import from auth/magic-link.
+  const wakeDir = join(TEMPLATE_ROOT, 'wake')
+  const wakeGlob = new Bun.Glob('**/*.ts')
+  for await (const entry of wakeGlob.scan({ cwd: wakeDir })) {
+    if (entry.endsWith('.test.ts') || entry.includes('__tests__/')) continue
+    const fullPath = join(wakeDir, entry)
+    const relFromModules = `wake/${entry}`
+    const lines = (await Bun.file(fullPath).text()).split('\n')
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      if (line.trimStart().startsWith('//') || line.trimStart().startsWith('*')) continue
+      if (MINT_MAGIC_LINK_IMPORT_RE.test(line)) {
+        errors.push({
+          file: fullPath,
+          line: i + 1,
+          message: `mintMagicLink import disallowed from ${relFromModules} — Principle 6 (token issuance never blocks the wake transaction); allowed in [modules/team/service/staff-ping.ts, modules/automations/service/admin-alert.ts, modules/automations/service/dispatcher.ts]`,
+        })
+      }
+    }
+  }
+
+  // Third pass: enforce mintMagicLink import boundary within modules/
+  // (re-scan same files as the first pass but only for the import boundary rule,
+  // since MINT_MAGIC_LINK_ALLOWED is modules-relative and the first pass was
+  // already iterating; avoiding a second full Glob by inlining the check
+  // would make the first loop too long — keep it as a focused separate pass).
+  for await (const entry of glob.scan({ cwd: MODULES_DIR })) {
+    if (entry.endsWith('.test.ts') || entry.includes('__tests__/')) continue
+    const fullPath = join(MODULES_DIR, entry)
+    const relFromModules = `modules/${entry}`
+    if (MINT_MAGIC_LINK_ALLOWED.some((p) => relFromModules === p)) continue
+    const lines = (await Bun.file(fullPath).text()).split('\n')
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      if (line.trimStart().startsWith('//') || line.trimStart().startsWith('*')) continue
+      if (MINT_MAGIC_LINK_IMPORT_RE.test(line)) {
+        errors.push({
+          file: fullPath,
+          line: i + 1,
+          message: `mintMagicLink import disallowed from ${relFromModules} — Principle 6 (token issuance never blocks the wake transaction); allowed in [modules/team/service/staff-ping.ts, modules/automations/service/admin-alert.ts, modules/automations/service/dispatcher.ts]`,
+        })
+      }
+    }
+  }
+
+  // Fourth pass: enforce captor-helper import boundary across the whole
+  // template (auth/, modules/, wake/, runtime/). Only auth/magic-link.ts (and
+  // the US-017 future auth/phone-otp.ts) may instantiate a captor.
+  const templateGlob = new Bun.Glob('{auth,modules,wake,runtime}/**/*.ts')
+  for await (const entry of templateGlob.scan({ cwd: TEMPLATE_ROOT })) {
+    if (entry.endsWith('.test.ts') || entry.includes('__tests__/')) continue
+    const fullPath = join(TEMPLATE_ROOT, entry)
+    const lines = (await Bun.file(fullPath).text()).split('\n')
+    const errs = lintCaptorHelperImports(entry, lines)
+    for (const msg of errs) {
+      errors.push({ file: fullPath, message: msg })
+    }
+  }
+}
+
+const REQUIRED_CAPABILITY_KEYS = [
+  'templates',
+  'media',
+  'reactions',
+  'readReceipts',
+  'typingIndicators',
+  'streaming',
+  'messagingWindow',
+  'nativeThreading',
+] as const
+
+async function checkCapabilityLiterals(): Promise<void> {
+  const glob = new Bun.Glob('**/adapters/**/{factory,adapter}.ts')
+  const searchRoot = join(MODULES_DIR)
+  const capBlockRe = /capabilities\s*(?::\s*ChannelCapabilities)?\s*=\s*\{([^}]+)\}/g
+
+  for await (const entry of glob.scan({ cwd: searchRoot })) {
+    if (entry.endsWith('.test.ts')) continue
+    const fullPath = join(searchRoot, entry)
+    const text = await Bun.file(fullPath).text()
+    const matches = [...text.matchAll(capBlockRe)]
+    for (const match of matches) {
+      const block = match[1]
+      for (const key of REQUIRED_CAPABILITY_KEYS) {
+        if (!new RegExp(`\\b${key}\\s*:`).test(block)) {
+          errors.push({
+            file: fullPath,
+            message: `capability literal missing required key "${key}" — add it to ChannelCapabilities`,
+          })
+        }
+      }
+    }
+  }
+}
+
+const MODULE_FILES = ['agents', 'contacts', 'drive', 'messaging', 'team', 'channels']
+
+const INLINE_LITERAL_RE = /^\s{2,}(tools|listeners|materializers|commands|sideLoad)\s*:\s*[[{]/
+const CTX_REGISTER_RE = /ctx\.register[A-Z]\w*/
+
+async function checkModuleTsShape(): Promise<void> {
+  for (const mod of MODULE_FILES) {
+    const path = join(MODULES_DIR, mod, 'module.ts')
+    if (!(await Bun.file(path).exists())) continue
+    const lines = (await Bun.file(path).text()).split('\n')
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      if (line.trimStart().startsWith('//') || line.trimStart().startsWith('*')) continue
+      if (INLINE_LITERAL_RE.test(line)) {
+        const m = INLINE_LITERAL_RE.exec(line)
+        errors.push({
+          file: path,
+          line: i + 1,
+          message: `module.ts must be an aggregator; move \`${m?.[1]}:\` into sibling \`agent.ts\` and re-export`,
+        })
+      }
+      if (CTX_REGISTER_RE.test(line)) {
+        errors.push({
+          file: path,
+          line: i + 1,
+          message: 'init(ctx) must not call ctx.register* — contributions belong on the ModuleDef itself',
+        })
+      }
+    }
+  }
+}
+
+interface MaterializerLike {
+  path: unknown
+  phase: unknown
+  materialize?: unknown
+}
+
+interface AgentSurface {
+  tools?: Array<{ name: unknown }>
+  listeners?: Record<string, unknown>
+  materializers?: Array<MaterializerLike | ((...args: unknown[]) => unknown)>
+  commands?: Array<{ name: unknown }>
+  sideLoad?: unknown[]
+}
+
+interface JobLike {
+  name: unknown
+  handler?: unknown
+  disabled?: unknown
+}
+
+interface ModuleLike {
+  name: string
+  agent?: AgentSurface
+  jobs?: readonly JobLike[]
+}
+
+const VALID_PHASES = new Set(['frozen'])
+
+function trackUnique(seen: Map<string, string>, kind: string, moduleName: string, name: unknown): void {
+  if (typeof name !== 'string' || name.length === 0) {
+    errors.push({
+      file: `modules/${moduleName}`,
+      message: `${kind} in module "${moduleName}" has a non-string/empty name`,
+    })
+    return
+  }
+  const prev = seen.get(name)
+  if (prev !== undefined) {
+    errors.push({
+      file: `modules/${moduleName}`,
+      message: `duplicate ${kind} name "${name}" declared by both "${prev}" and "${moduleName}"`,
+    })
+  } else {
+    seen.set(name, moduleName)
+  }
+}
+
+function checkModuleContracts(): void {
+  const modules = registeredModules as unknown as readonly ModuleLike[]
+
+  const toolNames = new Map<string, string>()
+  const commandNames = new Map<string, string>()
+  const jobNames = new Map<string, string>()
+
+  for (const mod of modules) {
+    const agent = mod.agent
+    if (agent?.tools) {
+      for (const tool of agent.tools) trackUnique(toolNames, 'tool', mod.name, tool?.name)
+    }
+    if (agent?.commands) {
+      for (const cmd of agent.commands) trackUnique(commandNames, 'command', mod.name, cmd?.name)
+    }
+    if (agent?.listeners) {
+      for (const [slot, list] of Object.entries(agent.listeners)) {
+        if (list === undefined) continue
+        if (!Array.isArray(list)) {
+          errors.push({
+            file: `modules/${mod.name}`,
+            message: `listener slot "${slot}" must be an array of functions`,
+          })
+          continue
+        }
+        for (let i = 0; i < list.length; i++) {
+          if (typeof list[i] !== 'function') {
+            errors.push({
+              file: `modules/${mod.name}`,
+              message: `agent.listeners.${slot}[${i}] must be a function, got ${typeof list[i]}`,
+            })
+          }
+        }
+      }
+    }
+    if (agent?.materializers) {
+      for (let i = 0; i < agent.materializers.length; i++) {
+        const m: unknown = agent.materializers[i]
+        if (typeof m === 'function') continue // WakeMaterializerFactory — produces materializers at wake time
+        const obj = m as MaterializerLike
+        if (typeof obj.path !== 'string' || !obj.path.startsWith('/')) {
+          errors.push({
+            file: `modules/${mod.name}`,
+            message: `agent.materializers[${i}].path must be an absolute workspace path starting with "/", got ${JSON.stringify(obj.path)}`,
+          })
+        }
+        if (typeof obj.phase !== 'string' || !VALID_PHASES.has(obj.phase)) {
+          errors.push({
+            file: `modules/${mod.name}`,
+            message: `agent.materializers[${i}].phase must be one of ${[...VALID_PHASES].join('|')}, got ${JSON.stringify(obj.phase)}`,
+          })
+        }
+        if (typeof obj.materialize !== 'function') {
+          errors.push({
+            file: `modules/${mod.name}`,
+            message: `agent.materializers[${i}].materialize must be a function`,
+          })
+        }
+      }
+    }
+    if (mod.jobs) {
+      for (const job of mod.jobs) {
+        if (job.disabled === true) continue
+        trackUnique(jobNames, 'job', mod.name, job.name)
+      }
+    }
+  }
+}
+
+/**
+ * Surface enforcement: every top-level route in `src/routes.ts` must appear in
+ * the explicit allowlist below. Adding a new top-level route requires a
+ * deliberate update to this list — preventing UI drift back to a
+ * flat-everything URL space.
+ *
+ * Allowlist entries:
+ *   - `/`                    — home redirect to /inbox
+ *   - `/auth/*`              — login + pending (auth layout)
+ *   - `/onboard/*`           — post-invite onboarding (phone verify, etc.; auth layout)
+ *   - `/inbox`               — canonical messaging surface
+ *   - `/messaging`           — legacy redirect → /inbox
+ *   - `/settings`            — admin / personal settings (cross-cutting)
+ *   - `/channels`            — admin (channel instances + adapter config)
+ *   - `/automations`         — operator dashboard for rules, wakes, budget, runs
+ *   - `/test-web`, `/chat/$channelInstanceId` — public widget shell + chat
+ *   - `/contacts`, `/team`, `/agents`, `/drive` — module-owned surfaces
+ */
+const ALLOWED_ROUTE_PREFIXES = [
+  '/',
+  '/auth',
+  '/onboard',
+  '/inbox',
+  '/messaging',
+  '/settings',
+  '/channels',
+  '/automations',
+  '/test-web',
+  '/chat',
+  '/contacts',
+  '/team',
+  '/agents',
+  '/drive',
+  '/changes',
+  // Child routes nested inside a parent declare relative paths (e.g. /$instanceId/…
+  // under /channels). The checker sees these paths out of parent context — allow them.
+  '/$instanceId',
+]
+
+const ROUTE_DECL_RE = /(?:route|physical)\s*\(\s*['"](\/[^'"]+)['"]/g
+
+async function checkRouteSurfaces(): Promise<void> {
+  const routesPath = join(TEMPLATE_ROOT, 'src', 'routes.ts')
+  if (!(await Bun.file(routesPath).exists())) return
+  const text = await Bun.file(routesPath).text()
+  const lines = text.split('\n')
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    if (line.trimStart().startsWith('//') || line.trimStart().startsWith('*')) continue
+    ROUTE_DECL_RE.lastIndex = 0
+    const matches = [...line.matchAll(ROUTE_DECL_RE)]
+    for (const match of matches) {
+      const path = match[1]
+      const allowed = ALLOWED_ROUTE_PREFIXES.some((prefix) => path === prefix || path.startsWith(`${prefix}/`))
+      if (!allowed) {
+        errors.push({
+          file: routesPath,
+          line: i + 1,
+          message: `route "${path}" must mount under /inbox, /workspace, or one of the explicit admin/auth allowlist prefixes — update ALLOWED_ROUTE_PREFIXES in scripts/check-module-shape.ts if this is a deliberate new top-level surface`,
+        })
+      }
+    }
+  }
+}
+
+if (import.meta.main) {
+  await checkJournalWriteAuthority()
+  await checkCapabilityLiterals()
+  await checkModuleTsShape()
+  await checkRouteSurfaces()
+  checkModuleContracts()
+
+  if (errors.length > 0) {
+    console.error('\ncheck-module-shape: FAILED\n')
+    for (const err of errors) {
+      const loc = err.line ? `${err.file}:${err.line}` : err.file
+      console.error(`  ${loc}: ${err.message}`)
+    }
+    console.error(`\n${errors.length} error(s) found.`)
+    process.exit(1)
+  }
+
+  console.log('check-module-shape: OK')
+  process.exit(0)
+}

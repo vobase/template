@@ -1,0 +1,146 @@
+/**
+ * Generic CRUD for channel instances.
+ *
+ * Adapter-agnostic: `config` is opaque JSONB. Each adapter's
+ * `adapters/<name>/config.ts` Zod schema validates the payload before it lands
+ * here — the frontend layer is responsible for picking the right schema by
+ * channel name.
+ */
+
+import { type OrganizationEnv, requireOrganization } from '@auth/middleware'
+import { zValidator } from '@hono/zod-validator'
+import {
+  createInstance,
+  getInstance,
+  listInstances,
+  removeInstance,
+  updateInstance,
+} from '@modules/channels/service/instances'
+import { getRequireAdmin } from '@modules/channels/service/state'
+import { Hono, type MiddlewareHandler } from 'hono'
+import { z } from 'zod'
+
+/** Lazy admin gate — pulls from channels state installed in `module.ts.init`. */
+// biome-ignore lint/suspicious/useAwait: Hono MiddlewareHandler contract requires async signature
+const lazyRequireAdmin: MiddlewareHandler = async (c, next) => {
+  const mw = getRequireAdmin()
+  if (!mw) return c.json({ error: 'auth not initialised' }, 503)
+  return mw(c, next)
+}
+
+const createBody = z.object({
+  channel: z.string().min(1).max(64),
+  role: z.enum(['customer', 'staff']).optional(),
+  displayName: z.string().min(1).max(120).nullable(),
+  config: z.record(z.string(), z.unknown()).default({}),
+  webhookSecret: z.string().min(1).nullable().optional(),
+})
+
+const updateBody = z.object({
+  displayName: z.string().min(1).max(120).nullable().optional(),
+  /** Replaces the whole `config` blob if present. */
+  config: z.record(z.string(), z.unknown()).optional(),
+  /** Shallow-merged into the existing `config` (server-side). */
+  configPatch: z.record(z.string(), z.unknown()).optional(),
+  webhookSecret: z.string().min(1).nullable().optional(),
+  status: z.string().min(1).nullable().optional(),
+  setupStage: z.string().min(1).nullable().optional(),
+  lastError: z.string().nullable().optional(),
+})
+
+const invalidBody = (
+  result: { success: boolean; error?: { issues: unknown } },
+  c: { json: (b: unknown, s: number) => Response },
+) => (result.success ? undefined : c.json({ error: 'invalid_body', issues: result.error?.issues }, 400))
+
+/** Shallow merge: undefined keeps existing, null deletes the key, otherwise overwrites. */
+function mergeConfig(existing: Record<string, unknown>, patch: Record<string, unknown>): Record<string, unknown> {
+  const next = { ...existing }
+  for (const [k, v] of Object.entries(patch)) {
+    if (v === null) delete next[k]
+    else if (v !== undefined) next[k] = v
+  }
+  return next
+}
+
+// Reads (GET) require any org member. Mutations require admin: a rogue staff
+// member shouldn't be able to flip a tenant's WhatsApp config.
+const app = new Hono<OrganizationEnv>()
+  .use('*', requireOrganization)
+  .use('/', async (c, next) => (c.req.method === 'GET' ? next() : lazyRequireAdmin(c, next)))
+  .use('/:id', async (c, next) => (c.req.method === 'GET' ? next() : lazyRequireAdmin(c, next)))
+  .get('/', async (c) => {
+    const channel = c.req.query('channel') ?? undefined
+    const rows = await listInstances(c.get('organizationId'), channel)
+    return c.json(rows)
+  })
+  // Minimal projection for the live "importing chat history" toast — no config
+  // secrets, cheap to poll. Returns only WhatsApp instances that have a
+  // coexistence history-import status recorded by the drain.
+  .get('/history-sync', async (c) => {
+    const rows = await listInstances(c.get('organizationId'), 'whatsapp')
+    const syncs = rows.flatMap((r) => {
+      const ch = (
+        r.config as {
+          coexistenceHistory?: { status?: 'importing' | 'imported' | 'declined'; progress?: number }
+        } | null
+      )?.coexistenceHistory
+      if (!ch?.status) return []
+      return [{ instanceId: r.id, displayName: r.displayName, status: ch.status, progress: ch.progress ?? 0 }]
+    })
+    return c.json({ syncs })
+  })
+  .get('/:id', async (c) => {
+    const id = c.req.param('id')
+    const row = await getInstance(id)
+    if (!row) return c.json({ error: 'not_found' }, 404)
+    return c.json(row)
+  })
+  .post('/', zValidator('json', createBody, invalidBody), async (c) => {
+    const data = c.req.valid('json')
+    const row = await createInstance({
+      organizationId: c.get('organizationId'),
+      channel: data.channel,
+      role: data.role,
+      displayName: data.displayName,
+      config: data.config,
+      webhookSecret: data.webhookSecret ?? null,
+    })
+    return c.json(row, 201)
+  })
+  .patch('/:id', zValidator('json', updateBody, invalidBody), async (c) => {
+    const organizationId = c.get('organizationId')
+    const id = c.req.param('id')
+    const data = c.req.valid('json')
+    let nextConfig = data.config
+    if (data.configPatch) {
+      const existing = await getInstance(id)
+      if (!existing) return c.json({ error: 'not_found' }, 404)
+      nextConfig = mergeConfig(existing.config, data.configPatch)
+    }
+    try {
+      const row = await updateInstance(id, organizationId, {
+        displayName: data.displayName,
+        config: nextConfig,
+        webhookSecret: data.webhookSecret,
+        status: data.status,
+        setupStage: data.setupStage,
+        lastError: data.lastError,
+      })
+      return c.json(row)
+    } catch (err) {
+      // Service throws this exact message when the row isn't found in the
+      // org-scoped query. Anything else is an unexpected DB error — let it bubble.
+      if (err instanceof Error && err.message === 'channels/instances: row not found') {
+        return c.json({ error: 'not_found' }, 404)
+      }
+      throw err
+    }
+  })
+  .delete('/:id', async (c) => {
+    const id = c.req.param('id')
+    await removeInstance(id, c.get('organizationId'))
+    return c.json({ ok: true })
+  })
+
+export default app

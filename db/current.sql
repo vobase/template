@@ -1,0 +1,8 @@
+-- One-off DML / DDL staging area
+-- Inline SQL here gets prepended to the next `db:generate` migration and
+-- baked into history; this file resets to empty afterwards. Use --!include
+-- to pull in shared SQL fragments via glob.
+--
+-- Extensions + nanoid + functions + triggers are NOT included here — they
+-- already live in the initial migration (baked once at first db:generate)
+-- and don't need to re-run on subsequent migrations.

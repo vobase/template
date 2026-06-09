@@ -1,0 +1,520 @@
+import type { ApiKeySummaryDto, CreatedApiKeyDto } from '@modules/settings/handlers/api-keys'
+import { useSettingsSave } from '@modules/settings/hooks/use-settings-save'
+import {
+  NOTIFICATION_CHANNELS,
+  NOTIFICATION_KINDS,
+  type NotificationChannel,
+  type NotificationKind,
+  type NotificationPrefsMatrix,
+} from '@modules/settings/notification-prefs-types'
+import type { NotificationsValues } from '@modules/settings/pages/schemas'
+import { notificationsSchema } from '@modules/settings/pages/schemas'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { createFileRoute, Link } from '@tanstack/react-router'
+import { Check, Copy, MonitorIcon, MoonIcon, Send, SunIcon, Trash2 } from 'lucide-react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { toast } from 'sonner'
+
+import { InfoCard, InfoRow, InfoSection } from '@/components/info'
+import { PageBody, PageHeader, PageLayout } from '@/components/layout/page-layout'
+import { PhoneVerificationBadge } from '@/components/phone-verification-badge'
+import { SettingsToggle } from '@/components/settings'
+import { SettingsSegmented } from '@/components/settings/settings-segmented'
+import { useTheme } from '@/components/theme-provider'
+import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
+import { Input } from '@/components/ui/input'
+import { RelativeTimeCard } from '@/components/ui/relative-time'
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { settingsClient } from '@/lib/api-client'
+import { authClient } from '@/lib/auth-client'
+
+const THEME_OPTIONS = [
+  { value: 'light', label: 'Light', icon: <SunIcon /> },
+  { value: 'dark', label: 'Dark', icon: <MoonIcon /> },
+  { value: 'system', label: 'System', icon: <MonitorIcon /> },
+]
+
+const FONT_SIZE_OPTIONS = [
+  { value: 'sm', label: 'Small' },
+  { value: 'md', label: 'Medium' },
+  { value: 'lg', label: 'Large' },
+]
+
+const FONT_SIZE_MAP: Record<string, string> = { sm: '13px', md: '15px', lg: '17px' }
+
+interface NotificationPrefsResponse {
+  matrix: NotificationPrefsMatrix
+  notifyWhileOnline: boolean
+}
+
+type SaveState = 'idle' | 'saving' | 'saved' | 'error'
+
+const KIND_META: Record<NotificationKind, { label: string; description: string }> = {
+  mention: { label: 'Mentions', description: 'When an internal note @-mentions me' },
+  decision: {
+    label: 'Decisions',
+    description: 'When an agent needs my decision on a pending approval or change proposal',
+  },
+  admin_alert: {
+    label: 'Admin alerts',
+    description: 'Operator-level alerts about pauses, budget breaches, system health',
+  },
+}
+
+const CHANNEL_LABEL: Record<NotificationChannel, string> = {
+  in_app: 'In-app',
+  whatsapp: 'WhatsApp',
+  email: 'Email',
+}
+
+function SaveIndicator({ state }: { state: SaveState }) {
+  if (state === 'saving') return <span className="text-muted-foreground text-xs">Saving…</span>
+  if (state === 'saved') {
+    return (
+      <span className="inline-flex items-center gap-1 text-muted-foreground text-xs">
+        <Check className="size-3.5 text-emerald-600 dark:text-emerald-400" />
+        Saved
+      </span>
+    )
+  }
+  if (state === 'error') return <span className="text-destructive text-xs">Save failed</span>
+  return null
+}
+
+function useAutoSave<T>(values: T | null | undefined, save: (values: T) => Promise<unknown>): SaveState {
+  const [state, setState] = useState<SaveState>('idle')
+  const lastSerialized = useRef<string | null>(null)
+  const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => {
+    if (values === null || values === undefined) return
+    const serialized = JSON.stringify(values)
+    if (lastSerialized.current === null) {
+      lastSerialized.current = serialized
+      return
+    }
+    if (lastSerialized.current === serialized) return
+    lastSerialized.current = serialized
+
+    const debounce = setTimeout(() => {
+      setState('saving')
+      save(values)
+        .then(() => {
+          setState('saved')
+          if (savedTimerRef.current) clearTimeout(savedTimerRef.current)
+          savedTimerRef.current = setTimeout(() => setState('idle'), 1500)
+        })
+        .catch((err) => {
+          setState('error')
+          toast.error(err instanceof Error ? err.message : 'Save failed')
+        })
+    }, 400)
+    return () => clearTimeout(debounce)
+  }, [values, save])
+
+  useEffect(
+    () => () => {
+      if (savedTimerRef.current) clearTimeout(savedTimerRef.current)
+    },
+    [],
+  )
+
+  return state
+}
+
+function AppearanceSection() {
+  const { theme, setTheme } = useTheme()
+  const [fontSize, setFontSize] = useState<'sm' | 'md' | 'lg'>('md')
+
+  useEffect(() => {
+    document.documentElement.style.fontSize = FONT_SIZE_MAP[fontSize] ?? '15px'
+  }, [fontSize])
+
+  return (
+    <InfoSection title="Appearance">
+      <InfoCard>
+        <InfoRow label="Theme">
+          <SettingsSegmented
+            name="theme"
+            value={theme}
+            onValueChange={(v) => setTheme(v as 'light' | 'dark' | 'system')}
+            options={THEME_OPTIONS}
+            className="w-full sm:w-[260px]"
+          />
+        </InfoRow>
+        <InfoRow label="Font size">
+          <SettingsSegmented
+            name="fontSize"
+            value={fontSize}
+            onValueChange={(v) => setFontSize(v as 'sm' | 'md' | 'lg')}
+            options={FONT_SIZE_OPTIONS}
+            className="w-full sm:w-[260px]"
+          />
+        </InfoRow>
+      </InfoCard>
+    </InfoSection>
+  )
+}
+
+/**
+ * Inline callout above the Notifications table. Shows the signed-in user's
+ * WhatsApp number + verification badge + an "Update" link that opens the
+ * staff edit dialog (via `?edit=1` on `/team/$userId`).
+ */
+function WhatsAppCallout({
+  phoneNumber,
+  verified,
+  userId,
+}: {
+  phoneNumber: string | null
+  verified: boolean
+  userId: string | null
+}) {
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-3 border-border/50 border-b px-4 py-3 text-sm">
+      <div className="flex items-center gap-3 leading-none">
+        <span className="text-muted-foreground">WhatsApp:</span>
+        {phoneNumber ? (
+          <>
+            <span className="font-mono">{phoneNumber}</span>
+            <PhoneVerificationBadge verified={verified} />
+          </>
+        ) : (
+          <span className="text-muted-foreground">Not set</span>
+        )}
+      </div>
+      {userId && (
+        <Button asChild size="sm" variant="outline">
+          <Link to="/team/$userId" params={{ userId }} search={{ edit: '1' }}>
+            Update
+          </Link>
+        </Button>
+      )}
+    </div>
+  )
+}
+
+const isDevMode = import.meta.env.DEV
+
+function NotificationsSection() {
+  const { mutate } = useSettingsSave('notifications', notificationsSchema)
+
+  const testMut = useMutation({
+    mutationFn: async (kind: NotificationKind): Promise<{ ok: boolean; reason?: string }> => {
+      const r = await settingsClient.notifications.test.$post({ json: { kind } })
+      if (!r.ok) {
+        const body = (await r.json().catch(() => null)) as { error?: string } | null
+        throw new Error(body?.error ?? `test failed: ${r.status}`)
+      }
+      return (await r.json()) as { ok: boolean; reason?: string }
+    },
+    onSuccess: (res) => {
+      if (res.ok) toast.success('Test notification sent — check your WhatsApp')
+      else toast.error(`Test not sent: ${res.reason ?? 'unknown'}`)
+    },
+    onError: (err) => toast.error(err instanceof Error ? err.message : 'Test failed'),
+  })
+  const { data } = useQuery({
+    queryKey: ['settings', 'notifications'],
+    queryFn: async (): Promise<NotificationPrefsResponse> => {
+      const r = await settingsClient.notifications.$get()
+      if (!r.ok) throw new Error(`notifications.get failed: ${r.status}`)
+      return (await r.json()) as NotificationPrefsResponse
+    },
+  })
+
+  const sessionRes = authClient.useSession() as unknown as {
+    data?: {
+      user?: { id?: string; phoneNumber?: string | null; phoneNumberVerified?: boolean | null } | null
+    } | null
+  } | null
+  const sessionUser = sessionRes?.data?.user ?? null
+  const userId = sessionUser?.id ?? null
+  const phoneNumber = sessionUser?.phoneNumber ?? null
+  const phoneVerified = sessionUser?.phoneNumberVerified === true
+
+  const [matrix, setMatrix] = useState<NotificationPrefsMatrix | null>(null)
+  const [notifyWhileOnline, setNotifyWhileOnline] = useState<boolean | null>(null)
+  useEffect(() => {
+    if (data) {
+      setMatrix(data.matrix)
+      setNotifyWhileOnline(data.notifyWhileOnline)
+    }
+  }, [data])
+
+  const save = useCallback(
+    (v: NotificationsValues) => {
+      return mutate(v)
+    },
+    [mutate],
+  )
+  const saveValues: NotificationsValues | null =
+    matrix && data && notifyWhileOnline !== null ? { matrix, notifyWhileOnline } : null
+  const saveState = useAutoSave<NotificationsValues>(saveValues, save)
+
+  function setCell(kind: NotificationKind, channel: NotificationChannel, value: boolean): void {
+    setMatrix((prev) => {
+      const base = prev ?? {}
+      const cellRow = { ...(base[kind] ?? {}), [channel]: value }
+      return { ...base, [kind]: cellRow }
+    })
+  }
+
+  function cellValue(kind: NotificationKind, channel: NotificationChannel): boolean {
+    return matrix?.[kind]?.[channel] === true
+  }
+
+  return (
+    <InfoSection
+      title="Notifications"
+      description="Choose how each notification type reaches you."
+      actions={<SaveIndicator state={saveState} />}
+    >
+      <InfoCard>
+        <WhatsAppCallout phoneNumber={phoneNumber} verified={phoneVerified} userId={userId} />
+        <Table className="text-sm">
+          <TableHeader>
+            <TableRow>
+              <TableHead className="w-[40%]">Event</TableHead>
+              {NOTIFICATION_CHANNELS.map((channel) => {
+                const isWhatsApp = channel === 'whatsapp'
+                const disabledHeader = isWhatsApp && !phoneVerified
+                const headerCell = (
+                  <span className={disabledHeader ? 'text-muted-foreground' : undefined}>{CHANNEL_LABEL[channel]}</span>
+                )
+                return (
+                  <TableHead key={channel} className="w-[20%] text-center">
+                    {disabledHeader ? (
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <span className="inline-block">{headerCell}</span>
+                        </TooltipTrigger>
+                        <TooltipContent>Verify your WhatsApp number to enable.</TooltipContent>
+                      </Tooltip>
+                    ) : (
+                      headerCell
+                    )}
+                  </TableHead>
+                )
+              })}
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {NOTIFICATION_KINDS.map((kind) => (
+              <TableRow key={kind}>
+                <TableCell className="align-middle">
+                  <div className="flex flex-col gap-0.5">
+                    <span className="font-medium">{KIND_META[kind].label}</span>
+                    <span className="text-muted-foreground text-xs">{KIND_META[kind].description}</span>
+                  </div>
+                </TableCell>
+                {NOTIFICATION_CHANNELS.map((channel) => {
+                  const isWhatsApp = channel === 'whatsapp'
+                  const disabled = (isWhatsApp && !phoneVerified) || matrix === null
+                  const checkbox = (
+                    <Checkbox
+                      checked={cellValue(kind, channel)}
+                      onCheckedChange={(v) => setCell(kind, channel, v === true)}
+                      disabled={disabled}
+                      aria-label={`${KIND_META[kind].label} via ${CHANNEL_LABEL[channel]}`}
+                    />
+                  )
+                  const cellContent =
+                    isWhatsApp && !phoneVerified ? (
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <span className="inline-block">{checkbox}</span>
+                        </TooltipTrigger>
+                        <TooltipContent>Verify your WhatsApp number to enable.</TooltipContent>
+                      </Tooltip>
+                    ) : (
+                      checkbox
+                    )
+                  return (
+                    <TableCell key={channel} className="text-center align-middle">
+                      {isWhatsApp && isDevMode ? (
+                        <div className="flex items-center justify-center gap-1.5">
+                          {cellContent}
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                type="button"
+                                size="icon"
+                                variant="ghost"
+                                className="size-6 text-muted-foreground"
+                                disabled={!phoneVerified || testMut.isPending}
+                                onClick={() => testMut.mutate(kind)}
+                                aria-label={`Send a test ${KIND_META[kind].label} notification`}
+                              >
+                                <Send className="size-3.5" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>Send a test WhatsApp notification (dev only)</TooltipContent>
+                          </Tooltip>
+                        </div>
+                      ) : (
+                        cellContent
+                      )}
+                    </TableCell>
+                  )
+                })}
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+        <SettingsToggle
+          label="Notify me while online"
+          description="When on, mention WhatsApp notifications reach me even when I'm currently online (otherwise they're skipped since I'd see the note in-app)."
+          checked={notifyWhileOnline === true}
+          onCheckedChange={(v) => setNotifyWhileOnline(v)}
+          disabled={notifyWhileOnline === null}
+        />
+      </InfoCard>
+    </InfoSection>
+  )
+}
+
+function ApiKeysSection() {
+  const qc = useQueryClient()
+  const [name, setName] = useState('')
+  const [revealed, setRevealed] = useState<CreatedApiKeyDto | null>(null)
+
+  const { data: keys = [], isLoading } = useQuery({
+    queryKey: ['settings', 'api-keys'],
+    queryFn: async (): Promise<ApiKeySummaryDto[]> => {
+      const r = await settingsClient['api-keys'].$get()
+      if (!r.ok) throw new Error(`api-keys.list failed: ${r.status}`)
+      return (await r.json()) as ApiKeySummaryDto[]
+    },
+  })
+
+  const createMut = useMutation({
+    mutationFn: async (input: { name: string }): Promise<CreatedApiKeyDto> => {
+      const r = await settingsClient['api-keys'].$post({ json: input })
+      if (!r.ok) {
+        const body = (await r.json().catch(() => null)) as { error?: string } | null
+        throw new Error(body?.error ?? 'Failed to create key')
+      }
+      return (await r.json()) as CreatedApiKeyDto
+    },
+    onSuccess: (created) => {
+      setRevealed(created)
+      setName('')
+      qc.invalidateQueries({ queryKey: ['settings', 'api-keys'] })
+    },
+    onError: (err) => toast.error(err instanceof Error ? err.message : 'Failed to create key'),
+  })
+
+  const revokeMut = useMutation({
+    mutationFn: async (id: string): Promise<void> => {
+      const r = await settingsClient['api-keys'][':id'].$delete({ param: { id } })
+      if (!r.ok) throw new Error(`api-keys.revoke failed: ${r.status}`)
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['settings', 'api-keys'] })
+      toast.success('Key revoked')
+    },
+    onError: (err) => toast.error(err instanceof Error ? err.message : 'Failed to revoke key'),
+  })
+
+  function copyKey() {
+    if (!revealed) return
+    navigator.clipboard
+      .writeText(revealed.key)
+      .then(() => toast.success('Copied to clipboard'))
+      .catch(() => toast.error('Copy failed'))
+  }
+
+  function onSubmitCreate(e: React.FormEvent) {
+    e.preventDefault()
+    if (name.trim().length === 0) return
+    createMut.mutate({ name: name.trim() })
+  }
+
+  return (
+    <InfoSection title="API Keys" description="Authenticate the Vobase CLI and external integrations.">
+      <form className="flex items-center gap-2" onSubmit={onSubmitCreate}>
+        <Input
+          className="h-8 w-[240px]"
+          placeholder="Key name"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          disabled={createMut.isPending}
+        />
+        <Button size="sm" type="submit" disabled={createMut.isPending || name.trim().length === 0}>
+          {createMut.isPending ? 'Creating…' : 'Create key'}
+        </Button>
+      </form>
+
+      {revealed && (
+        <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-4">
+          <div className="mb-2 font-medium text-sm">Copy your new key — it won't be shown again.</div>
+          <div className="flex items-center gap-2">
+            <code className="flex-1 truncate rounded-md bg-background px-3 py-2 font-mono text-xs">{revealed.key}</code>
+            <Button size="sm" variant="outline" onClick={copyKey}>
+              <Copy />
+              Copy
+            </Button>
+            <Button size="sm" variant="ghost" onClick={() => setRevealed(null)}>
+              Done
+            </Button>
+          </div>
+        </div>
+      )}
+
+      <InfoCard>
+        {isLoading && <InfoRow label="Loading…" />}
+        {!isLoading && keys.length === 0 && (
+          <InfoRow label="No keys yet">
+            <span className="text-muted-foreground">Create one above to get started.</span>
+          </InfoRow>
+        )}
+        {keys.map((k) => (
+          <InfoRow key={k.id} label={k.name ?? '(unnamed)'}>
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex flex-col">
+                <code className="font-mono text-muted-foreground text-xs">{k.start ?? k.prefix ?? ''}…</code>
+                <span className="inline-flex items-center gap-1 text-muted-foreground text-xs">
+                  Created <RelativeTimeCard date={new Date(k.createdAt)} length="short" />
+                  {k.lastRequest && (
+                    <>
+                      {' · last used '}
+                      <RelativeTimeCard date={new Date(k.lastRequest)} length="short" />
+                    </>
+                  )}
+                </span>
+              </div>
+              <Button size="sm" variant="ghost" disabled={revokeMut.isPending} onClick={() => revokeMut.mutate(k.id)}>
+                <Trash2 />
+                Revoke
+              </Button>
+            </div>
+          </InfoRow>
+        ))}
+      </InfoCard>
+    </InfoSection>
+  )
+}
+
+export function SettingsPage() {
+  return (
+    <PageLayout>
+      <PageHeader title="Settings" description="Personal preferences and access keys." />
+      <PageBody>
+        <div className="mx-auto w-full max-w-4xl space-y-8">
+          <AppearanceSection />
+          <NotificationsSection />
+          <ApiKeysSection />
+        </div>
+      </PageBody>
+    </PageLayout>
+  )
+}
+
+export default SettingsPage
+
+export const Route = createFileRoute('/_app/settings')({
+  component: SettingsPage,
+})

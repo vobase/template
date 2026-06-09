@@ -1,0 +1,2090 @@
+# @vobase/template
+
+## 3.20.1
+
+### Patch Changes
+
+- [#115](https://github.com/vobase/vobase/pull/115) [`e79ce2c`](https://github.com/vobase/vobase/commit/e79ce2ccd6275db47e0faf6f439d17e307e5907c) Thanks [@yuann3](https://github.com/yuann3)! - fix(messaging): make the wake conversation authoritative in conversation-scoped CLI verbs
+
+  `conv reassign`, `conv set-owner`, and `conv learn` resolved their target as
+  `input.conversationId ?? ctx.wake?.conversationId`, which let an in-wake agent
+  override the harness-injected conversation by passing `--conversationId`. In a
+  production incident an agent passed a channel-instance id (read from a drive file
+  path) as `--conversationId`; the `conv reassign` customer-ack guard
+  (`hasRecentAgentReply`) then checked a non-existent conversation, found no reply,
+  and refused the human handoff twice — stranding the lead on the AI agent.
+
+  Flip the precedence so the wake's conversation wins; `--conversationId` is only
+  honored for out-of-wake HTTP-RPC callers, whose `ctx.wake` is undefined. This
+  closes the same class of bug in `conv set-owner` (owner set on the wrong
+  conversation) and `conv learn` (learning pass run on the wrong thread). Adds unit
+  tests for all three verbs: an in-wake stray `--conversationId` is ignored, and the
+  out-of-wake fallback is preserved.
+
+## 3.20.0
+
+### Minor Changes
+
+- [#113](https://github.com/vobase/vobase/pull/113) [`0b1ba90`](https://github.com/vobase/vobase/commit/0b1ba90679e89df01f39521e6e0f26107ccedd42) Thanks [@yuann3](https://github.com/yuann3)! - # One-click staff WhatsApp phone verification
+
+  Staff can verify their own WhatsApp number from anywhere in the app, instead of digging four clicks deep into the edit-profile dialog. Verification stays self-only — the OTP is delivered to the number's owner, so the affordances only ever appear on the signed-in user's own row.
+
+  - **Top-right verify nudge** — a persistent toast prompts a signed-in staff member whose own number is set but unverified (typically after they skipped the onboarding verify step), with a one-click "Verify now". A dismissal is remembered for the tab session and the nudge auto-clears the instant the number is verified.
+  - **Inline "Verify" affordance** — a self-only Verify link in the WhatsApp cell of the team list and the WhatsApp row of the staff profile, shown only on the current user's own unverified row.
+  - **Focused verify dialog** — a standalone dialog with the saved number pre-filled and editable (so a typo can be fixed before sending), then a 6-digit OTP. All three entry points open it through one global `openPhoneVerify()`.
+  - **Shared, tested engine** — the nudge gate, the `updatePhoneNumber` self-collision guard, and the OTP error mapping live in one framework-free module with 17 unit tests; the existing edit-profile widget is rewired onto the same code path. No new backend — it reuses better-auth's phone-number plugin and reads the session cast-free via `authClient.$Infer`.
+
+## 3.19.0
+
+### Minor Changes
+
+- [`b965a08`](https://github.com/vobase/vobase/commit/b965a083d4466a815f8be5a770b51d6dc689208b) Thanks [@mdluo](https://github.com/mdluo)! - # Contact attributes in PROFILE, learning controls, history toast, and two fixes
+
+  A batch of generic helpdesk improvements.
+
+  - **Contact attribute schema in PROFILE.md** — the contact PROFILE now renders the tenant's attribute-definition schema (key, label, type, options, example), so the agent proposes `attributes.*` edits against attributes that actually exist instead of guessing keys.
+  - **`LEARN_AUTO_TRIAGE` kill-switch** — an opt-out env switch that disables the automatic learning-triage producers (self-reflection, coaching notes, staff takeover, proposal rejection, coexistence echoes) without a code change. Defaults on; the triage job and candidate side-load stay wired so manual triggers still work.
+  - **Manual "learn from this thread" trigger** — staff can send a conversation through the learning loop on demand from the conversation detail view or a `conv learn` CLI verb, via a new `'manual'` learning-signal kind that bypasses the kill-switch and debounce window.
+  - **Live WhatsApp history-import toast** — a top-right toast tracks coexistence chat-history import progress, backed by a `/history-sync` projection over `whatsapp_history_chunks`.
+  - **Fix: `field_set 'segments'` accepts a single string** — previously a string value silently wiped segments to `[]` while reporting success; now a string is wrapped to a one-element array, an array is written verbatim, null clears, and anything else throws.
+  - **Fix: channel disconnect/release errors surface** — the disconnect mutation now toasts an actionable message (role hint on a 403, generic retry otherwise) instead of failing silently with the confirm dialog stuck open.
+
+- [`fa1c371`](https://github.com/vobase/vobase/commit/fa1c371e4e4d82413100b11911239c0a7cebb4d2) Thanks [@mdluo](https://github.com/mdluo)! - # WhatsApp coexistence chat-history import
+
+  When a business connects via WhatsApp coexistence, Meta can deliver up to 180 days of prior on-phone conversation history. The inbox now imports that history as resolved conversations, so the agent and staff have full customer context from day one instead of an empty inbox.
+
+  New schema (a DB push/migrate is required when upgrading a scaffold):
+
+  | Table                              | Purpose                                                                                                                                                                        |
+  | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+  | `channels.whatsapp_history_chunks` | Durable single-writer staging for each `field:"history"` webhook chunk, UNIQUE on `(channel_instance, phase, chunk_order)` so redelivery is idempotent; drained asynchronously |
+
+  What ships with it:
+
+  - **Sync request** — `meta-oauth.syncSmbAppData` requests history + contacts sync after onboarding (wired from the signup finish and the setup job). `POST /finish/:instanceId` accepts `{ resync: ["history"] }` to re-request when Meta accepts the request but never delivers the burst.
+  - **Staging + drain** — the `field:"history"` webhook is intercepted and each chunk staged in `whatsapp_history_chunks`; `jobs/history-drain.ts` drains in bounded passes, `parse-history.ts` turns each chunk into messages (with a digits-only business-vs-customer direction check), and `conversations.backfillHistoricalMessages` writes them in batches inside one transaction per thread.
+  - **Media + naming** — `jobs/history-media.ts` downloads and attaches history media; the contacts-sync webhook names imported contacts instead of leaving them phone-only.
+  - **Resolution** — `conversations.resolveImportedHistory` closes pure-history threads in bounded id-batches once a thread's chunks are fully drained. Business-App-sent history messages are labelled distinctly and attributed to Staff in the thread.
+  - **Auditability** — backfill emits one `conversation.history_imported` event per imported conversation and resolve emits one `conversation.history_resolved`, both idempotent on re-drain and rendered as single timeline activity rows.
+
+  Also: contacts with no display name (e.g. a phone-only history-backfill contact) now render as their email/phone in the principal directory rather than the opaque id.
+
+### Patch Changes
+
+- [`9e7040f`](https://github.com/vobase/vobase/commit/9e7040f14103e933b0ea67dfc1da9481df818c90) Thanks [@mdluo](https://github.com/mdluo)! - # Drive embeddings via Bifrost, no embed-token cap, and a race-safe contact upsert
+
+  Three production-hardening fixes for the drive knowledge base and contact sync.
+
+  ## Drive embeddings route through the Bifrost gateway
+
+  The drive embedding helper read `OPENAI_API_KEY` and called OpenAI directly, unlike `wake/llm.ts` which routes through Bifrost when `BIFROST_API_KEY` + `BIFROST_URL` are set. In a Bifrost-only production (no `OPENAI_API_KEY`) every extraction job failed with `embedding_unavailable: OPENAI_API_KEY is not set`, so `drive.chunks` stayed empty and hybrid `drive search` returned nothing. Embeddings now go through `createOpenAI({ baseURL, apiKey })` pointed at the gateway with the `openai/`-prefixed model id when the Bifrost vars are present, falling back to the direct OpenAI endpoint for local dev. The same provider gate is applied to query-time embedding, so semantic search works in production too — not just ingestion.
+
+  ## The per-org daily embed-token cap is no longer enforced
+
+  A per-day embed-token gate stalled a legitimate one-shot knowledge-base backfill, which embeds an org's whole document set in a single burst. Embedding is comparatively cheap, so the cap cost more in blocked backfills than it saved. The gate is removed from `checkBudget` (the OCR page cap — the expensive lever — is retained), and `embedTokens` usage is still rolled up by `getTodayUsage` for observability.
+
+  ## Contact upsert is idempotent under concurrent same-identity inserts
+
+  Two upserts for the same person (e.g. a retried/redelivered WhatsApp `smb_app_state_sync` burst running while the first delivery is still in flight) both saw an empty `contacts` table, both INSERTed, and the loser threw a `uq_contacts_tenant_phone` duplicate-key error. The identity insert now uses `onConflictDoNothing` and re-resolves the winner when it loses the race, so every concurrent caller returns the same contact id and none throw.
+
+## 3.18.1
+
+### Patch Changes
+
+- Updated dependencies [[`13017bb`](https://github.com/vobase/vobase/commit/13017bb4920e84280f55061037eb399b97570954)]:
+  - @vobase/core@0.43.3
+
+## 3.18.0
+
+### Minor Changes
+
+- [`8d85b50`](https://github.com/vobase/vobase/commit/8d85b50aba6e9d9ebe7b21e8ddc04365e252fa3b) Thanks [@mdluo](https://github.com/mdluo)! - # Lead routing + conversation ownership, scriptable agent ops, and a blocking wake test verb
+
+  A batch of operator- and agent-facing capabilities: a staff-attribute–driven lead-routing engine with conversation ownership, three CLI verbs for managing an agent's skills without a redeploy, a one-call end-to-end wake test verb, and an explicit-save markdown editor.
+
+  ## Attribute-driven lead routing + conversation ownership
+
+  Leads now route to staff by **profile attributes** rather than a hardcoded picker, and conversations carry an **owner** (staff-in-charge) distinct from the assignee (whoever currently replies).
+
+  Routing resolves in three tiers, with a least-recently-assigned tiebreak so volume spreads evenly:
+
+  1. **Exclusive** rule — a keyword bound to a single rep wins outright.
+  2. **Pool keyword** — a keyword maps to a pool; the least-recently-assigned member of that pool takes it.
+  3. **Corporate-lead fallback** — when nothing matches, the lead falls to staff carrying the relevant `team_lead` attribute.
+
+  Keyword matching is whole-word and longest-match-wins, so a more specific rule beats a broader one regardless of declaration order.
+
+  New schema (a DB push/migrate is required when upgrading a scaffold):
+
+  | Table / column                                                           | Purpose                                                                                                    |
+  | ------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------- |
+  | `staff_profiles.attributes` (jsonb)                                      | Per-staff booleans/values (`corporate_team`, `private_team`, `team_lead`, …) that drive routing membership |
+  | `staff_attribute_definitions`                                            | Tenant-defined attribute catalog (key, label, type, options, show-in-table)                                |
+  | `routing_rules`                                                          | `exclusive` / `pool_keyword` / `corporate_lead` rules (keyword, pool, repUserId, priority)                 |
+  | `team_descriptions.lead_user_id`                                         | Per-team lead                                                                                              |
+  | `conversations.owner_user_id` + `owner_assigned_at` (+ `idx_conv_owner`) | Conversation owner and the timestamp the round-robin reads for least-recently-assigned                     |
+
+  What ships with it:
+
+  - **`lead-routing` service** — the resolver above, reading staff attributes and `routing_rules`.
+  - **`route-lead` agent tool** — lets the agent route a lead from inside a wake.
+  - **`team routing` CLI verb** — `list` / `set` / `rm` / `simulate` / `check`. `simulate` dry-runs a `(company, industry)` against the live rule set; `check` validates that the fallback attributes exist so routing can't dead-end.
+  - **`team set-attribute` CLI verb** — set a staff attribute (`--user --key --value`) without touching the DB directly.
+  - **`conv set-owner` CLI verb** — set/clear a conversation's owner (`--to=user:<id>|unassigned`); staff-tier. The agent keeps replying regardless of owner.
+  - **`/team/routing` admin UI** — view and edit routing rules; the team pages surface membership, priority, and owner/responder badges.
+
+  ## Scriptable agent skill management
+
+  Three admin verbs make an agent's skill set fully scriptable — no redeploy, no DB surgery:
+
+  | Verb                   | Flags                                           | Effect                                               |
+  | ---------------------- | ----------------------------------------------- | ---------------------------------------------------- |
+  | `agents set-allowlist` | `--id --skills=<csv>`                           | Replace `skillAllowlist` wholesale (empty clears it) |
+  | `agents set-skill`     | `--id --name --body` (+ `--description --tags`) | Upsert a `learned_skills` row; bumps `version`       |
+  | `agents remove-skill`  | `--id --name`                                   | Delete a `learned_skills` row; idempotent            |
+
+  Note the nuance `remove-skill` exists to handle: **trimming the allowlist alone does not hide a skill** — the drive overlay mounts a `SKILL.md` for every `learned_skills` row regardless of the allowlist, so making an obsolete skill disappear requires deleting the row. Backed by new `upsertLearnedSkill` / `removeLearnedSkill` service methods and a `skillAllowlist` field on `UpdateAgentInput`.
+
+  ## `agents debug wake-sync` — one-call end-to-end wake test
+
+  Injects a simulated web inbound through the generic channel `dispatchInbound` (faithful routing: assignment, 24h window, debounce, wake enqueue) and **blocks until the resulting wake reaches a terminal `agent_end`**, returning the wake summary plus per-tool-call detail in a single call. It collapses the manual "send → poll messages → cross-check notes" loop operators used for behavior testing.
+
+  ```
+  vobase agents debug wake-sync --text="..." [--from=<stable-key>] [--assign=agent:<id>] [--timeout=120]
+  ```
+
+  - Reuse `--from` across calls to drive a multi-turn conversation on the same contact (each call carries a fresh `externalMessageId`, so it always wakes).
+  - Returns `status: 'settled' | 'timeout' | 'no_wake'`; `endReason: 'blocked'` means the wake paused on an approval (card / file / book-slot) rather than producing a reply.
+  - Admin-tier; never exposed to a wake's bash sandbox.
+
+  Backed by a `waitForWake` reader on the debug-readers service — a watermark-scoped poll of `harness.conversation_events` that locks onto the first wake started after the trigger and ignores stale ones.
+
+  ## Drive markdown editor: explicit save
+
+  The drive-document and agent-instruction editors no longer autosave on every keystroke. They now use an explicit **Save** button and compute the dirty flag against a round-tripped baseline (serialized on mount, refreshed after each save), so a freshly opened, untouched document no longer reports itself dirty.
+
+  ## `vobase-cli-ops` skill refresh
+
+  The bundled `vobase-cli-ops` skill's verb catalog now documents the verbs above (skill management, `team set-attribute`, `team routing`, `conv set-owner`, `agents debug wake-sync`), corrects the text-verb flag note (`--body` / `--body-from`, not `--file`), and ships a tighter trigger description.
+
+  ## Test coverage
+
+  - `team/service/lead-routing.test.ts` + `lead-routing.integration.test.ts` — routing resolution and tiebreak.
+  - `tests/e2e/wake-sync-wait.e2e.test.ts` — the `waitForWake` status state machine (settled / timeout / no_wake / watermark filtering / block-then-settle), 5 cases against real Postgres.
+  - Ownership and routing wiring updated across the messaging/team service and e2e suites.
+
+## 3.17.3
+
+### Patch Changes
+
+- [`65b7747`](https://github.com/vobase/vobase/commit/65b774789bfc3b030b0cf6af2afddbfc0e2fff5d) Thanks [@mdluo](https://github.com/mdluo)! - fix(channels): drop inbound events targeting released channel instances
+
+  Released rows stay in the DB to preserve `fk_conv_channel_instance`, but every webhook ingress was happily resolving them and persisting new inbound. When a tenant disconnects a WhatsApp channel, Meta keeps delivering webhooks until subscribe_apps is cleaned up — those events were landing on the released row as if it were still active.
+
+  - `handlers/webhook.ts` (generic provider webhook — WABA lands here): return 404 on both GET (challenge) and POST when `status === 'released'`.
+  - `adapters/web/handlers/inbound.ts`: look up the instance up-front and reject with 410 `channel_released` so widgets can't push to a disconnected channel.
+  - `service/inbound.ts::dispatchInbound`: belt-and-suspenders — warn-log and return `[]` if the resolved instance is released, so any future ingress path that forgets the handler check still can't leak.
+
+  The managed-channel router already gated on `status === 'active'`.
+
+- [`3f3c15a`](https://github.com/vobase/vobase/commit/3f3c15a60653efea974306da1a9698896d80bd25) Thanks [@mdluo](https://github.com/mdluo)! - fix(messaging): stop attributing WABA echoes and optimistic replies to staff[0]
+
+  The renderer parses `[<displayName>] ` body prefixes to identify staff authors. Two cases fell through to the `directory.staff[0]` fallback and showed the first teammate by mistake:
+
+  - WhatsApp Business App echoes arrive with `metadata.echoSource === 'business_app'` and no body prefix (Meta only reports the business phone, never the individual sender). `messagePrincipal` now returns `null` for these rows so they render as a generic staff bubble instead of mis-attributing.
+  - The reply composer's optimistic row inserted the raw, unprefixed body, hitting the same fallback for one frame before the server response replaced it. `useStaffReply` now pre-prefixes the optimistic body with the current staff's display name (mirroring server-side `prefixWithStaffName`), eliminating the flicker.
+
+## 3.17.2
+
+### Patch Changes
+
+- Updated dependencies [[`7759605`](https://github.com/vobase/vobase/commit/775960541b25cb460a2fcac6def588cb9aa04caa)]:
+  - @vobase/core@0.43.2
+
+## 3.17.1
+
+### Patch Changes
+
+- Updated dependencies [[`4cf453c`](https://github.com/vobase/vobase/commit/4cf453c83adc1bd161b9a85acd111d3860e6426e)]:
+  - @vobase/core@0.43.1
+
+## 3.17.0
+
+### Minor Changes
+
+- [`95a2c2e`](https://github.com/vobase/vobase/commit/95a2c2e558f3e8db0c2be858634b17edaf8717ad) Thanks [@mdluo](https://github.com/mdluo)! - # Magic-link finish + notification-settings collapse
+
+  Closes out the per-env magic-link refactor and collapses the notification-tier channel into a single first-class table. Hard cutover — no dual-shape, no env-var fallback, no deferred follow-ups.
+
+  ## Tenant-side magic-link finish
+
+  The `/auth/magic-finish` route is now covered by a full security test suite (`auth/magic-finish.test.ts`, 7 cases): happy-path cookie issuance, single-use replay rejection, expired-token deletion, organization-membership gating, open-redirect rejection, missing-param handling, and the platform challenge probe.
+
+  Token verification was simplified to better-auth's internal `consumeVerificationValue` (atomic read+delete), removing the hand-rolled attempt-counter and the race between `findVerificationValue` and the manual attempt bump. A pinned comment documents why the full `auth.api.magicLinkVerify` endpoint is not adopted (it owns the redirect, sets its own cookie, and has no organization-membership gate).
+
+  ## notification_settings — one row per org
+
+  The platform-routed notification number is no longer modeled as a fake `channel_instances` row. A new `notification_settings` table holds one row per organization:
+
+  | Column                                            | Purpose                                                      |
+  | ------------------------------------------------- | ------------------------------------------------------------ |
+  | `notificationEndpointId`                          | platform webhook endpoint for staff-notification routing     |
+  | `magicLinkEndpointId`                             | platform webhook endpoint for the magic-link finish redirect |
+  | `platformHmacSecretEnvelope`                      | envelope-encrypted HMAC secret for outbound platform calls   |
+  | `platformBaseUrl`                                 | platform host for relayed sends                              |
+  | `displayPhoneNumber` / `phoneNumberId` / `wabaId` | WhatsApp number metadata                                     |
+
+  `getNotificationSettings` / `upsertNotificationSettings` / `decryptNotificationHmac` are the single write path. `sendNotificationText` replaces the WhatsApp adapter's `managed-notif` send branch.
+
+  ## Bootstrap auto-registration — no manual operator step
+
+  `claimAndBootstrap` now runs `provisionNotificationSettings` as a required step: it claims the platform notification number, registers both the `whatsapp_notif` and `magic_link` webhook endpoints, and writes the `notification_settings` row — idempotently, so re-running on a provisioned org is a no-op. The old `MAGIC_LINK_ENDPOINT_ID` environment variable is gone; the endpoint id is read from the database row.
+
+  ## Removed
+
+  Hard cutover deleted every surface that existed only because the notification number was forced through the channel registry:
+
+  - `notification` kind from the managed-channel registry; `ManagedChannelKind` narrowed to `sandbox`
+  - `isManagedNotifConfig` predicate + the `managed-notif` instance mode
+  - `vobase-platform-notification` vault provider
+  - `staff_reply` inbound-dispatch branch + `staff-reply-dispatch.ts`
+  - `whatsapp_notif` channel registration + `WHATSAPP_NOTIF_CHANNEL_NAME`
+  - `findNotificationChannel` service helper
+  - `MAGIC_LINK_ENDPOINT_ID` environment variable
+  - "Connect platform notification" rows, chips, and dialog options across the channels UI
+
+  ## Test coverage
+
+  43 files changed. New: `magic-finish.test.ts` (7 cases), `notification-provision.test.ts` (2 cases), plus two notification-path cases in `bootstrap.test.ts`. 13 existing test files migrated from the `findNotificationChannel` / `whatsapp_notif` fixture shape to `getNotificationSettings` / `upsertNotificationSettings`. Targeted suites 77/77 green; full template suite 741 passing.
+
+### Patch Changes
+
+- [`fb2755d`](https://github.com/vobase/vobase/commit/fb2755d717deb0962f141ed96e682fd15b4d4724) Thanks [@mdluo](https://github.com/mdluo)! - # Staff-notification reply routing — correctness + cross-tenant hardening
+
+  Reply-routing fixes and a security review on the shared WhatsApp notification channel.
+
+  ## Reply routing fixes
+
+  - A staff member's WhatsApp reply to an agent's notification now re-engages the right party. The reply note's body is prefixed with the `@handle` of whoever authored the note that triggered the ping — agent or staff — so the body-driven staff-note fan-out actually fires. A bare reply previously set the `mentions` column but woke nobody.
+  - The operator-thread wake reads the latest _user_ message off the thread, not the latest message of any role, so a second back-to-back message is the one the agent sees.
+  - Agent replies mirrored out the notification channel carry an `[Agent]` prefix so staff can tell them apart from other notification-channel traffic.
+
+  ## Cross-tenant / cross-user hardening
+
+  Security review of the notification paths (one shared number across all tenants):
+
+  - The notification-mirror observer resolves the recipient phone fresh per dispatch, re-confirming verified org membership, instead of freezing it at wake start — a mid-wake phone change can no longer leak a reply.
+  - The `pending_staff_pings` upsert key is org-qualified, and a partial unique index on `outbound_wamid` lets the quote-reply claim rung treat the WAMID as a real key rather than a non-unique hint.
+  - The inbound staff-phone match is gated on `phone_number_verified`.
+  - A quote-reply to an already-expired ping now appends an operator-thread system hint instead of silently becoming a fresh agent instruction.
+
+  The platform-side counterpart — constraining reply routing to a phone's known `staff_link` set and binding quote-reply WAMIDs to the sender phone — ships in `vobase-platform`.
+
+  ## Terminology
+
+  Scoped "ping" (the WhatsApp staff-notification primitive, any kind) against "mention" (the `@-mention` act): removed the dead `PendingMentionPing*` aliases and corrected UI strings that called all-kind staff pings "mention pings".
+
+## 3.16.0
+
+### Minor Changes
+
+- [`4b80457`](https://github.com/vobase/vobase/commit/4b80457331ec80cb53c62f4ec726407093ec7de3) Thanks [@mdluo](https://github.com/mdluo)! - # Automations module, magic-link auth, WhatsApp OTP
+
+  A single sustained release: the schedules subsystem grows up into a first-class **automations module** with a typed event bus, dispatcher, budget caps, and operator dashboard; better-auth gains a **magic-link plugin + WhatsApp OTP captor** so staff pings deep-link straight into a signed-in session; and the WhatsApp surface picks up self-serve verification, OTP login, and a 24-hour free-form routing path that cuts the WA bill by ~95% inside the customer-service window.
+
+  ## Automations module
+
+  The old `modules/schedules` package handled cron rules and nothing else. It's been renamed to `modules/automations` and reshaped into the canonical event bus for the entire tenant:
+
+  - **Typed `emit(name, payload, { tx })`** — five events (`cron`, `staff-ping.required`, `automation.run-started`, `automation.run-finished`, `tenant-cost.daily-rolled`) cross seven producers (`messaging/service/notes`, `messaging/service/conversation`, `team/service/staff-ping`, `automations/service/cron-tick`, `automations/service/dispatcher`, `automations/service/budget-caps`, `automations/service/runs-prune`). A new `ts-morph`-backed `check:emit` AST scan in `scripts/check-emit.ts` is wired into `bun run check` and rejects any emit site outside that allowlist.
+  - **`automation_rules` + `automations` + `automation_runs` + `tenant_budget_caps`** — four tables under the new `automations` pgSchema. `automation_rules` is the rename target of `schedules.agent_schedules` (column-shape preserved); `automations` is the new event-driven rule table; `automation_runs` is the per-fire history; `tenant_budget_caps` enforces daily USD ceilings.
+  - **Dispatcher** — `dispatchEvent(name, payload, ctx)` resolves the matching rule rows, runs cooldown / pause / budget / verified-recipient gating, and enqueues either `agents:operator-thread-to-wake` (action.type=`wake`) or the WhatsApp staff-ping template send. Suppression reasons (`suppressed_cooldown`, `suppressed_paused`, `suppressed_budget`, `suppressed_unverified`) are first-class and surface on the dashboard.
+  - **Budget caps + budget watcher** — `tenant_budget_caps.daily_cap_usd` (INTEGER cents) is set via the `budget:set` CLI verb; `runBudgetWatcherTick` (currently unwired, pending agent assignment) re-checks daily cost every minute and, on breach, auto-pauses every rule that's flagged budget-eligible. The dispatcher rejects runs above the cap and records `suppressed_budget`.
+  - **`/automations` operator dashboard** — four widgets: cost / active-wakes / paused-rules / budget banner; per-rule table with pause + resume actions; active-wakes panel; 24h recent-runs table with per-wake cost from `harness.conversation_events`. Realtime invalidation fans `pg_notify` on `automations` + `automation_runs` + `tenant_budget_caps` into the matching TanStack Query keys.
+  - **CLI verbs** — `automations list/enable/disable/run` (in-process registry); `automations:pause` / `automations:resume` (HTTP-RPC dispatch behind admin auth); `budget:set` (clear or set cap in dollars).
+  - **Nightly retention** — `automations:runs-prune` recurring pg-boss job (3am UTC) DELETEs `automation_runs` older than the retention window; a dashboard placeholder row makes the sweep visible alongside live rules.
+
+  The new module is the **sole writer** for `automation_rules` / `automations` / `automation_runs` / `tenant_budget_caps`; `check:shape` rejects writes from anywhere else.
+
+  ## Magic-link auth + WhatsApp OTP captor
+
+  Staff get clickable WhatsApp notifications that deep-link into a signed-in session instead of an email-OTP prompt.
+
+  - **`magicLink` better-auth plugin** (`auth/magic-link.ts`) — issues HMAC-signed `magicLinkToken` rows scoped to `(userId, organizationId, redirectPath, expiresAt)`. The `/api/auth/verify-magic-link` endpoint exchanges the token for a session and sets the active organization atomically. Replay-resistant (one-shot consumption), TTL-bound (5 minutes), and tied to a `trustedOrigins` allowlist.
+  - **Captor pattern** (`auth/captor.ts`) — extracted shared infrastructure for "internal call captures a nonce, external caller validates it". Used by both `mintMagicLink` and `mintPhoneOtp` so token issuance is the only path; the AST check `check:shape::mint-import-boundary` enforces that `mintMagicLink` is imported only from `team/service/staff-ping.ts`, `automations/service/admin-alert.ts`, and `automations/service/dispatcher.ts`.
+  - **`magicVerifyHmacPlugin`** (`auth/magic-verify-hmac.ts`) — exposes `/verify-magic-link` + `/set-active-organization` behind tenant HMAC. The platform calls these from the WA template button handler to issue a session token before redirecting the browser.
+  - **Per-kind notification templates** — `vobase_tenant_notification_v1` (mentions), `vobase_approval_decision_v1`, `vobase_proposal_decision_v1`, `vobase_admin_alert_v2` — each with its own redirect-path builder (`redirectPathFor` in `notification-template-payloads.ts`). Approval / proposal flows now ship a one-tap deep-link straight to the gated decision.
+  - **Dispatcher gating** — `metaTemplateApprovals` lookup on the integration row decides whether to send via `vobase_*` templates or fall through to free-form; rows missing approvals skip silently with `suppressed_unverified` rather than surfacing a Meta 132001.
+
+  ## WhatsApp surface — verification, OTP login, 24h free-form
+
+  - **`phoneNumber.sendOTP` captor** wraps better-auth's stock plugin so OTPs go out through the platform's `vobase_platform_otp` template instead of an SMTP/SMS fallback.
+  - **Self-serve verification** — `writePhoneNumber` fires `mintPhoneOtp` fire-and-forget on every non-null phone change. `/_app` `beforeLoad` redirects unverified users to `/onboard/verify-phone?next=<original>` so deep-links survive the hop. Settings → Profile shows a "Verify WhatsApp" link + verified/unverified Status pill.
+  - **WhatsApp OTP login** — `/auth/login` gains a tabbed Email / WhatsApp UI; phone-mode signs the user in via `authClient.phoneNumber.verify` if the number matches an existing verified staff record. `signUpOnVerification` is intentionally off — unknown phones bounce, so the surface is restricted to staff already provisioned via email-OTP + invite.
+  - **Invite-accept via OTP** — `autoEnroll` checks for a pending invite _before_ the existing-membership guard (case-insensitive `lower(email)` match), so an OTP login on an invited-but-unaccepted email enrols the membership without poisoning the `auth.invitation.status` flow. `session.create.before` now picks the most-recently-created org so multi-org joiners land in the new inbox.
+  - **`/onboard/verify-phone`** — DiceUI `OTPInput` + magic-link fallback. Invitation-accept paths thread `invitationId` through `/auth/pending` so OTP completion calls `authClient.organization.acceptInvitation` and redirects to the joined org's inbox.
+  - **24h free-form routing** — `sendNotificationTemplate` now branches on `checkWithin24h(db, organizationId, staffPhoneE164)`. Inside the WhatsApp 24h customer-service window the message ships via `/api/whatsapp/freeform` (rendered by `renderTemplateAsText`, `wireRoute: 'freeform'`, cost $0). A Meta `131047` rejection falls back to the template path with a distinct idempotency key (`wireRoute: 'freeform_fallback_template'`) so the platform's 5-minute dedup window doesn't suppress the retry. Outside the window the existing template path is used unchanged.
+
+  ## New wake triggers
+
+  Five new `WakeTrigger` kinds (`mention_added`, `approval_resumed`, `proposal_decided`, `heartbeat`, `cron`) with deterministic renderers in `wake/trigger.ts`. The agents-side `pending_mention_pings` table is renamed to `pending_staff_pings` and gains soft-delete + a multi-kind discriminator (`mention` / `approval` / `proposal` / `admin_alert`). `pending-staff-pings-prune` cron sweeps claimed rows every 15 minutes. Cooldown helper (`cooldown.ts`) is shared across producers so the dispatcher, staff-ping, and admin-alert paths all honour the same suppression window.
+
+  ## UI
+
+  - **Operator dashboard rename** — `/system/activity` → `/automations`. Nav label, route, page heading, and inner section subheading now all read consistently. Section title 'Automations' inside the page is now 'Rules' (the page itself is "Automations"). Activity icon → Workflow.
+  - **Pause-rule dialog** — replaces `window.prompt('Reason for pausing this rule?')` with a shadcn `Dialog` containing a `Textarea`, Cancel + Pause-rule buttons, and submit gating on non-empty reason.
+  - **Pending invitations card** — `/team` now shows pending org invitations above the staff roster with Resend (bumps `expiresAt`) and Revoke (AlertDialog-gated tombstone) actions. Realtime invalidation wired through `auth_invitation` pg_notify.
+  - **`PhoneNumberInput` shared component** — enforces E.164 via `E164_RE` on blur with inline error. Migrated four call sites: verify-phone, staff-form-dialog, invite-member-dialog, contact-form-dialog. Contacts handler also gains a Zod refinement so malformed numbers are rejected before the dispatcher ever sees them.
+  - **Notification timeline events** — `notification.sent` / `notification.suppressed` `conversation_events` render in the message-thread activity timeline with `BellRingIcon` / `BellOffIcon`, `PrincipalAvatar`, `RelativeTimeCard`.
+  - **Channels polish** — sandbox + notification onboarding merged into placeholder rows + single Connect dialog; placeholder Connect button right-aligned to match `ChannelRowMenu`; `whatsapp_notif` rows now route to the WhatsApp adapter menu; managed channels inherit display name from the platform pool row label and honour `defaultAssignee` on notification claim; UI sorts platform-managed rows last and gates Connect on pool availability.
+  - **Settings copy** — 'Operator agent' section → 'Automation defaults' with clearer descriptions of what the default-agent dropdown and scheduled-reviews toggle actually control.
+  - **Mention fan-out gating** — fan-out now reads `phoneNumberVerified` and falls back to email when unverified; the @-mention picker shows a warning badge for unverified staff.
+
+  ## Bug fixes
+
+  - `auth.member` onConflictDoNothing had a target column on a non-existent UNIQUE; switched to no-target form (`28b3b0fe`).
+  - `session.create.before` was returning the first org row (stable across multi-org users); now orders `desc(createdAt)` so freshly-joined orgs are the active default (`28b3b0fe`).
+  - `channels/managed` webhook URL was using the literal string `'whatsapp'` instead of the channel name (`55b4c767`).
+  - `channels/ui` was routing `whatsapp_notif` rows to the wrong adapter menu (`0a49bf0c`).
+  - `channels/managed` notification claim ignored `defaultAssignee` (`e004825b`).
+  - `within-24h.test.ts` had a `null` vs `undefined` type mismatch on `insertLog.opts.from` (`dd870010`).
+
+  ## Test coverage
+
+  Five new integration suites alongside the existing harness:
+
+  - `invitations-lifecycle.integration.test.ts` — list filtering, resend bump, revoke tombstone, org-scope leak guards, re-invite after revoke.
+  - `notification-events-fanout.integration.test.ts` — `notification.sent` / `notification.suppressed` event recording across staff-ping + dispatcher paths.
+  - `invite-acceptance-redirects-to-verify-phone.integration.test.ts` — 4 cases covering unverified accept, verified accept, stale pre-existing membership, deep-link bypass.
+  - `staff-phone-change-triggers-otp.integration.test.ts` — fire-and-forget OTP send on phone write.
+  - `within-24h.integration.test.ts` + companion routing suite — five wire-route scenarios (free-form within 24h, outside 24h, no prior inbound, Meta 131047 fallback, cross-key dedup).
+
+  US-012 magic-link integration coverage: replay rejection, signature tampering, multi-org token scoping, end-to-end browser → session.
+
+  `bun run check` (shape, bundle, emit, contract, error-shape, auth-schema, no-auto-nav-tabs, shadcn-overrides, trust-defaults) and `bun run typecheck` clean; full template test suite passes.
+
+  ## Migration notes
+
+  - **`modules/schedules` → `modules/automations`** is a rename, not a wholesale rewrite. `automation_rules` preserves the `agent_schedules` column shape exactly; agent-defined cron rules continue to fire through the renamed `automations:cron-tick` job. The agent-visible tool name strings (`create_schedule`, `pause_schedule`) are preserved through the rename to protect existing `agent_definitions.skillAllowlist` rows + working memory; only the TypeScript exports moved (`createAutomationTool` / `pauseAutomationTool`).
+  - **Magic-link feature gates** — `metaTemplateApprovals` must be configured on the `integrations` row before the dispatcher will route notifications through the typed WA templates. Unconfigured orgs receive `suppressed_unverified` instead of a Meta failure.
+  - **`BETTER_AUTH_SECRET ≥ 32 chars`** is now load-bearing for HMAC-signed magic-link tokens in addition to the existing envelope-encryption keying.
+
+## 3.15.0
+
+### Minor Changes
+
+- [`cd64b9f`](https://github.com/vobase/vobase/commit/cd64b9fa796a6fee669a05ba697fc3c9444177d0) Thanks [@mdluo](https://github.com/mdluo)! - # Automations module, magic-link auth, WhatsApp OTP
+
+  A single sustained release: the schedules subsystem grows up into a first-class **automations module** with a typed event bus, dispatcher, budget caps, and operator dashboard; better-auth gains a **magic-link plugin + WhatsApp OTP captor** so staff pings deep-link straight into a signed-in session; and the WhatsApp surface picks up self-serve verification, OTP login, and a 24-hour free-form routing path that cuts the WA bill by ~95% inside the customer-service window.
+
+  ## Automations module
+
+  The old `modules/schedules` package handled cron rules and nothing else. It's been renamed to `modules/automations` and reshaped into the canonical event bus for the entire tenant:
+
+  - **Typed `emit(name, payload, { tx })`** — five events (`cron`, `staff-ping.required`, `automation.run-started`, `automation.run-finished`, `tenant-cost.daily-rolled`) cross seven producers (`messaging/service/notes`, `messaging/service/conversation`, `team/service/staff-ping`, `automations/service/cron-tick`, `automations/service/dispatcher`, `automations/service/budget-caps`, `automations/service/runs-prune`). A new `ts-morph`-backed `check:emit` AST scan in `scripts/check-emit.ts` is wired into `bun run check` and rejects any emit site outside that allowlist.
+  - **`automation_rules` + `automations` + `automation_runs` + `tenant_budget_caps`** — four tables under the new `automations` pgSchema. `automation_rules` is the rename target of `schedules.agent_schedules` (column-shape preserved); `automations` is the new event-driven rule table; `automation_runs` is the per-fire history; `tenant_budget_caps` enforces daily USD ceilings.
+  - **Dispatcher** — `dispatchEvent(name, payload, ctx)` resolves the matching rule rows, runs cooldown / pause / budget / verified-recipient gating, and enqueues either `agents:operator-thread-to-wake` (action.type=`wake`) or the WhatsApp staff-ping template send. Suppression reasons (`suppressed_cooldown`, `suppressed_paused`, `suppressed_budget`, `suppressed_unverified`) are first-class and surface on the dashboard.
+  - **Budget caps + budget watcher** — `tenant_budget_caps.daily_cap_usd` (INTEGER cents) is set via the `budget:set` CLI verb; `runBudgetWatcherTick` (currently unwired, pending agent assignment) re-checks daily cost every minute and, on breach, auto-pauses every rule that's flagged budget-eligible. The dispatcher rejects runs above the cap and records `suppressed_budget`.
+  - **`/automations` operator dashboard** — four widgets: cost / active-wakes / paused-rules / budget banner; per-rule table with pause + resume actions; active-wakes panel; 24h recent-runs table with per-wake cost from `harness.conversation_events`. Realtime invalidation fans `pg_notify` on `automations` + `automation_runs` + `tenant_budget_caps` into the matching TanStack Query keys.
+  - **CLI verbs** — `automations list/enable/disable/run` (in-process registry); `automations:pause` / `automations:resume` (HTTP-RPC dispatch behind admin auth); `budget:set` (clear or set cap in dollars).
+  - **Nightly retention** — `automations:runs-prune` recurring pg-boss job (3am UTC) DELETEs `automation_runs` older than the retention window; a dashboard placeholder row makes the sweep visible alongside live rules.
+
+  The new module is the **sole writer** for `automation_rules` / `automations` / `automation_runs` / `tenant_budget_caps`; `check:shape` rejects writes from anywhere else.
+
+  ## Magic-link auth + WhatsApp OTP captor
+
+  Staff get clickable WhatsApp notifications that deep-link into a signed-in session instead of an email-OTP prompt.
+
+  - **`magicLink` better-auth plugin** (`auth/magic-link.ts`) — issues HMAC-signed `magicLinkToken` rows scoped to `(userId, organizationId, redirectPath, expiresAt)`. The `/api/auth/verify-magic-link` endpoint exchanges the token for a session and sets the active organization atomically. Replay-resistant (one-shot consumption), TTL-bound (5 minutes), and tied to a `trustedOrigins` allowlist.
+  - **Captor pattern** (`auth/captor.ts`) — extracted shared infrastructure for "internal call captures a nonce, external caller validates it". Used by both `mintMagicLink` and `mintPhoneOtp` so token issuance is the only path; the AST check `check:shape::mint-import-boundary` enforces that `mintMagicLink` is imported only from `team/service/staff-ping.ts`, `automations/service/admin-alert.ts`, and `automations/service/dispatcher.ts`.
+  - **`magicVerifyHmacPlugin`** (`auth/magic-verify-hmac.ts`) — exposes `/verify-magic-link` + `/set-active-organization` behind tenant HMAC. The platform calls these from the WA template button handler to issue a session token before redirecting the browser.
+  - **Per-kind notification templates** — `vobase_tenant_notification` (mentions), `vobase_approval_decision`, `vobase_proposal_decision`, `vobase_admin_alert` — each with its own redirect-path builder (`redirectPathFor` in `notification-template-payloads.ts`). Approval / proposal flows now ship a one-tap deep-link straight to the gated decision.
+  - **Dispatcher gating** — `metaTemplateApprovals` lookup on the integration row decides whether to send via `vobase_*` templates or fall through to free-form; rows missing approvals skip silently with `suppressed_unverified` rather than surfacing a Meta 132001.
+
+  ## WhatsApp surface — verification, OTP login, 24h free-form
+
+  - **`phoneNumber.sendOTP` captor** wraps better-auth's stock plugin so OTPs go out through the platform's `vobase_platform_otp` template instead of an SMTP/SMS fallback.
+  - **Self-serve verification** — `writePhoneNumber` fires `mintPhoneOtp` fire-and-forget on every non-null phone change. `/_app` `beforeLoad` redirects unverified users to `/onboard/verify-phone?next=<original>` so deep-links survive the hop. Settings → Profile shows a "Verify WhatsApp" link + verified/unverified Status pill.
+  - **WhatsApp OTP login** — `/auth/login` gains a tabbed Email / WhatsApp UI; phone-mode signs the user in via `authClient.phoneNumber.verify` if the number matches an existing verified staff record. `signUpOnVerification` is intentionally off — unknown phones bounce, so the surface is restricted to staff already provisioned via email-OTP + invite.
+  - **Invite-accept via OTP** — `autoEnroll` checks for a pending invite _before_ the existing-membership guard (case-insensitive `lower(email)` match), so an OTP login on an invited-but-unaccepted email enrols the membership without poisoning the `auth.invitation.status` flow. `session.create.before` now picks the most-recently-created org so multi-org joiners land in the new inbox.
+  - **`/onboard/verify-phone`** — DiceUI `OTPInput` + magic-link fallback. Invitation-accept paths thread `invitationId` through `/auth/pending` so OTP completion calls `authClient.organization.acceptInvitation` and redirects to the joined org's inbox.
+  - **24h free-form routing** — `sendNotificationTemplate` now branches on `checkWithin24h(db, organizationId, staffPhoneE164)`. Inside the WhatsApp 24h customer-service window the message ships via `/api/whatsapp/freeform` (rendered by `renderTemplateAsText`, `wireRoute: 'freeform'`, cost $0). A Meta `131047` rejection falls back to the template path with a distinct idempotency key (`wireRoute: 'freeform_fallback_template'`) so the platform's 5-minute dedup window doesn't suppress the retry. Outside the window the existing template path is used unchanged.
+
+  ## New wake triggers
+
+  Five new `WakeTrigger` kinds (`mention_added`, `approval_resumed`, `proposal_decided`, `heartbeat`, `cron`) with deterministic renderers in `wake/trigger.ts`. The agents-side `pending_mention_pings` table is renamed to `pending_staff_pings` and gains soft-delete + a multi-kind discriminator (`mention` / `approval` / `proposal` / `admin_alert`). `pending-staff-pings-prune` cron sweeps claimed rows every 15 minutes. Cooldown helper (`cooldown.ts`) is shared across producers so the dispatcher, staff-ping, and admin-alert paths all honour the same suppression window.
+
+  ## UI
+
+  - **Operator dashboard rename** — `/system/activity` → `/automations`. Nav label, route, page heading, and inner section subheading now all read consistently. Section title 'Automations' inside the page is now 'Rules' (the page itself is "Automations"). Activity icon → Workflow.
+  - **Pause-rule dialog** — replaces `window.prompt('Reason for pausing this rule?')` with a shadcn `Dialog` containing a `Textarea`, Cancel + Pause-rule buttons, and submit gating on non-empty reason.
+  - **Pending invitations card** — `/team` now shows pending org invitations above the staff roster with Resend (bumps `expiresAt`) and Revoke (AlertDialog-gated tombstone) actions. Realtime invalidation wired through `auth_invitation` pg_notify.
+  - **`PhoneNumberInput` shared component** — enforces E.164 via `E164_RE` on blur with inline error. Migrated four call sites: verify-phone, staff-form-dialog, invite-member-dialog, contact-form-dialog. Contacts handler also gains a Zod refinement so malformed numbers are rejected before the dispatcher ever sees them.
+  - **Notification timeline events** — `notification.sent` / `notification.suppressed` `conversation_events` render in the message-thread activity timeline with `BellRingIcon` / `BellOffIcon`, `PrincipalAvatar`, `RelativeTimeCard`.
+  - **Channels polish** — sandbox + notification onboarding merged into placeholder rows + single Connect dialog; placeholder Connect button right-aligned to match `ChannelRowMenu`; `whatsapp_notif` rows now route to the WhatsApp adapter menu; managed channels inherit display name from the platform pool row label and honour `defaultAssignee` on notification claim; UI sorts platform-managed rows last and gates Connect on pool availability.
+  - **Settings copy** — 'Operator agent' section → 'Automation defaults' with clearer descriptions of what the default-agent dropdown and scheduled-reviews toggle actually control.
+  - **Mention fan-out gating** — fan-out now reads `phoneNumberVerified` and falls back to email when unverified; the @-mention picker shows a warning badge for unverified staff.
+
+  ## Bug fixes
+
+  - `auth.member` onConflictDoNothing had a target column on a non-existent UNIQUE; switched to no-target form (`28b3b0fe`).
+  - `session.create.before` was returning the first org row (stable across multi-org users); now orders `desc(createdAt)` so freshly-joined orgs are the active default (`28b3b0fe`).
+  - `channels/managed` webhook URL was using the literal string `'whatsapp'` instead of the channel name (`55b4c767`).
+  - `channels/ui` was routing `whatsapp_notif` rows to the wrong adapter menu (`0a49bf0c`).
+  - `channels/managed` notification claim ignored `defaultAssignee` (`e004825b`).
+  - `within-24h.test.ts` had a `null` vs `undefined` type mismatch on `insertLog.opts.from` (`dd870010`).
+
+  ## Test coverage
+
+  Five new integration suites alongside the existing harness:
+
+  - `invitations-lifecycle.integration.test.ts` — list filtering, resend bump, revoke tombstone, org-scope leak guards, re-invite after revoke.
+  - `notification-events-fanout.integration.test.ts` — `notification.sent` / `notification.suppressed` event recording across staff-ping + dispatcher paths.
+  - `invite-acceptance-redirects-to-verify-phone.integration.test.ts` — 4 cases covering unverified accept, verified accept, stale pre-existing membership, deep-link bypass.
+  - `staff-phone-change-triggers-otp.integration.test.ts` — fire-and-forget OTP send on phone write.
+  - `within-24h.integration.test.ts` + companion routing suite — five wire-route scenarios (free-form within 24h, outside 24h, no prior inbound, Meta 131047 fallback, cross-key dedup).
+
+  US-012 magic-link integration coverage: replay rejection, signature tampering, multi-org token scoping, end-to-end browser → session.
+
+  `bun run check` (shape, bundle, emit, contract, error-shape, auth-schema, no-auto-nav-tabs, shadcn-overrides, trust-defaults) and `bun run typecheck` clean; full template test suite passes.
+
+  ## Migration notes
+
+  - **`modules/schedules` → `modules/automations`** is a rename, not a wholesale rewrite. `automation_rules` preserves the `agent_schedules` column shape exactly; agent-defined cron rules continue to fire through the renamed `automations:cron-tick` job. The agent-visible tool name strings (`create_schedule`, `pause_schedule`) are preserved through the rename to protect existing `agent_definitions.skillAllowlist` rows + working memory; only the TypeScript exports moved (`createAutomationTool` / `pauseAutomationTool`).
+  - **Magic-link feature gates** — `metaTemplateApprovals` must be configured on the `integrations` row before the dispatcher will route notifications through the typed WA templates. Unconfigured orgs receive `suppressed_unverified` instead of a Meta failure.
+  - **`BETTER_AUTH_SECRET ≥ 32 chars`** is now load-bearing for HMAC-signed magic-link tokens in addition to the existing envelope-encryption keying.
+
+## 3.14.1
+
+### Patch Changes
+
+- [`49231d7`](https://github.com/vobase/vobase/commit/49231d746fcd5d47f0a8b37aca8d8a0f2871613c) Thanks [@mdluo](https://github.com/mdluo)! - Three independent template changes, batched:
+
+  **Operator-agent heartbeat kill-switch.** A new org-scoped setting,
+  `operatorHeartbeatEnabled`, gates the cron-driven standalone-lane wakes
+  (`renderStandaloneBrief`). The Settings → Operator agent section now exposes
+  a toggle backed by `useOrgSetting`, a new generic hook over the
+  `/api/settings/org-settings/:key` surface that replaces the two ~20-line
+  useQuery+useMutation pairs the page previously inlined. The kill-switch is
+  read once per cron tick (`tickSchedules` accepts a `disabledOrgIds` dep and
+  filters disabled orgs _before_ `recordTick`), so a 1000-org sweep does one
+  batched read instead of one round-trip per schedule and disabled orgs no
+  longer burn idempotency-row writes either. `OrgSettingsService` gains a
+  `listOrgsWithValue(key, value)` method to support that batch read.
+
+  **`send_file` accepts a public URL, not just a drive file.** The tool's
+  input is now `{ driveFileId XOR url, type?, caption? }`, both at the agent
+  boundary and at the `appendMediaMessage` service layer. URL-mode skips the
+  drive lookup and threat scan, infers `image|video|audio|document` from the
+  URL extension (with an explicit override), and persists a `{url, type,
+caption}` content blob the conversation renderer picks up as either an
+  inline `<img>` or an anchor. `send_file` is also removed from
+  `CUSTOMER_FACING_TOOL_NAMES` on staff_note wakes — a staff @-mention naming
+  a specific artefact is a directive, and the tool still goes through
+  `requiresApproval: true`. `reply_contact` and `send_card` stay banned
+  because their content is agent-authored. Adjacent prompt cleanup in
+  `messaging/agent.ts` clarifies the staff-note recipe (when `send_file` works,
+  when `add_note` is the right answer) and in `reply-contact.ts` clarifies
+  that pasted URLs render as bare links — use `send_file({url})` for inline
+  media.
+
+  **API-key rate limit defaults.** The better-auth plugin's stock
+  `apiKey()` defaults were 10 requests / 24h per key, which the operator CLI
+  trips immediately on catalog + verb fan-out and surfaces as a
+  `RATE_LIMITED` → 500 that reads like a revoked key. The plugin is now
+  configured with a 600 req/min cap and the `apikey` table defaults align
+  (60_000 / 600) so freshly-issued keys inherit the new policy without a
+  backfill. Tighten this once a real per-key policy lands.
+
+## 3.14.0
+
+### Minor Changes
+
+- [`c518705`](https://github.com/vobase/vobase/commit/c5187054526d24ec29ad0e013af2621b2f95f1a5) Thanks [@mdluo](https://github.com/mdluo)! - feat(messaging): unify the customer transcript and staff thread into one CONVERSATION.md
+
+  The conversation workspace exposed two materialized files — `MESSAGES.md`
+  (the customer-visible transcript) and `INTERNAL-NOTES.md` (the staff thread).
+  That layout structurally encoded the staff thread as a secondary file the
+  agent had to remember to open, which worked against treating staff as a
+  co-equal audience.
+
+  ## One interleaved timeline
+
+  `MESSAGES.md` and `INTERNAL-NOTES.md` are replaced by a single
+  `/contacts/<id>/<channelInstanceId>/CONVERSATION.md` — customer messages, the
+  agent's replies, and internal staff notes interleaved in time order. Each row
+  is audience-labelled:
+
+  - Customer-visible: `**Customer**`, `**Agent → customer**`, `**Staff → customer**`
+  - Internal: `**[internal] Agent**`, `**[internal] Staff:<id>**`, `**[internal] System**`
+
+  A staff note that landed right before the current customer message is now the
+  next line in the file, not a different file — structurally unmissable. The
+  merge is deterministic (equal timestamps break ties by message-before-note,
+  then id), so the materialized file stays byte-stable across re-renders within
+  a wake and the frozen-snapshot `systemHash` invariant holds.
+
+  `conversationSideLoad` collapses accordingly: it pushes one merged timeline,
+  and the previous conditional whole-`INTERNAL-NOTES.md` re-dump becomes a
+  one-line banner when a colleague's note is newer than the agent's last action.
+
+  ## Audience-boundary hardening
+
+  With customer-visible and staff-only content now in one file, the `**…**` row
+  header is the only thing telling the agent which audience a row belongs to.
+  Untrusted body content (customer message text, staff note bodies) is
+  blockquoted so a column-0 `**` is renderer-only — a message or note body
+  cannot typographically forge a row header of a different audience. Mention
+  tokens in the note header are stripped to the id charset for the same reason.
+
+  ## One row format everywhere
+
+  The agent sees conversation content in three places — the `CONVERSATION.md`
+  timeline, the wake-cue trigger renderers, and the unread-activity appendix —
+  and they previously rendered it three different ways. A shared
+  `modules/messaging/lib/conversation-row.ts` now owns the row vocabulary
+  (`messageAudienceLabel` / `noteAudienceLabel`), the blockquoting of untrusted
+  body text, and the timestamp format, so all three render the same
+  `**<audience>** (<timestamp>) <note>:` header + blockquoted body. The
+  unread-activity appendix's note rows now carry the `[internal]` audience
+  marker that previously only `CONVERSATION.md` had.
+
+  ## Timezone-aware timestamps
+
+  Conversation timestamps render in the org timezone (`ORG_TIMEZONE`) with an
+  explicit offset — e.g. `2026-05-14 18:30 GMT+08:00` — instead of bare UTC.
+  `formatRowTimestamp` is deterministic for a fixed input (no clock read), so it
+  is safe inside the frozen-snapshot renderers.
+
+  ## Surface updates
+
+  The rename is threaded through the read-only config, RO-error hints, the
+  `conversation-surface` AGENTS.md contributor, the `wake/trigger.ts` cue
+  renderers (inbound / staff-note / caption-ready), `wake/unread-activity.ts`
+  overflow pointers, the frozen-prompt preamble, the INDEX.md conversation
+  links, and the WhatsApp echo-coexistence prose.
+
+### Patch Changes
+
+- [`4bdf1c7`](https://github.com/vobase/vobase/commit/4bdf1c771aa68b3eedb519dcf60b4871c0363281) Thanks [@mdluo](https://github.com/mdluo)! - Fire mention notifications from the `consult_staff` agent tool
+
+  `consult_staff` wrote the internal note with resolved `mentions` but never
+  fired `fanOutNoteMentions` — so addressed staff got no WhatsApp ping when
+  offline, and no `pending_mention_pings` ledger row was recorded (the row that
+  correlates a staff member's WA reply back to the conversation and wakes the
+  agent). The fan-out only ran from the HTTP notes handler, not the agent
+  write path.
+
+  `consult_staff` now fires `fanOutNoteMentions(row)` after the note write,
+  fire-and-forget so a flaky provider can't fail the note. This makes the tool
+  the agent-write-path twin of the HTTP notes handler. Failures log via the
+  structured `logger`; the synchronous "service not installed" path (unit-test
+  contexts) is guarded and logged at `warn`.
+
+- [`077678d`](https://github.com/vobase/vobase/commit/077678dffe3032a09b5d8f5616c10e6808e09b81) Thanks [@mdluo](https://github.com/mdluo)! - Move the WhatsApp mention fan-out behind a durable pg-boss job
+
+  `fanOutNoteMentions` does WhatsApp I/O per mentioned staff member and writes
+  the `pending_mention_pings` correlation row that wakes the asking agent on a
+  reply. It was invoked fire-and-forget (`void ...catch()`) from the
+  `consult_staff` agent tool and the HTTP notes handler — so a process recycle
+  mid-send silently lost the fan-out and its ledger row.
+
+  It now runs behind a `team:fanout-mention-pings` pg-boss job: producers call
+  `enqueueMentionFanOut`, the team job handler runs `fanOutNoteMentions` on the
+  worker. The work survives a process recycle and gets pg-boss retry semantics,
+  with a per-note `singletonKey` deduping retries. The job payload is
+  Zod-validated at the handler boundary and carries only the note fields the
+  fan-out consumes.
+
+- [`7a95f87`](https://github.com/vobase/vobase/commit/7a95f87cc1501f556d4c2566956fc5abac159f69) Thanks [@mdluo](https://github.com/mdluo)! - Add a static `## Execution Bias` section to the frozen system prompt
+
+  The agent had per-turn behavioral guidance (the conversation-lane `# Task`
+  side-load, which frames _who_ to address first) but nothing static and
+  every-wake encoding _how_ to work — explore before acting, finish actionable
+  requests, ground answers in evidence, vary approach on weak results, continue
+  until resolved or genuinely blocked, check live state. Agents would jump
+  straight to a reply off the wake cue without reading the workspace.
+
+  `buildFrozenPrompt` now renders an `## Execution Bias` section as its own
+  `execution-bias` prompt region. It is fully static (no per-wake
+  interpolation, so `systemHash` stays byte-stable) and reaches every lane,
+  including standalone wakes. Adapted from openclaw's equivalent section.
+
+## 3.13.0
+
+### Minor Changes
+
+- [`f537cc0`](https://github.com/vobase/vobase/commit/f537cc0e6e7b651e53a3fd1f03a2074a662c3a49) Thanks [@mdluo](https://github.com/mdluo)! - feat(messaging): split the agent write-surface into three audience-named tools
+
+  During testing the agent jumped to `reply` too quickly — answering the customer
+  before exploring the workspace — and over-indexed on the customer while
+  under-communicating with staff. The root cause was structural: the customer
+  transcript was _pushed_ into every turn's prompt while the staff thread was a
+  _file the agent had to remember to open_, and the single write verb the agent
+  confused (`reply`) was named without an audience.
+
+  ## Three audience-named tools
+
+  The messaging agent surface is now explicit about _who_ a message reaches:
+
+  - **`reply_contact`** — renamed from `reply`. Plain-text message to the customer.
+    The rename is threaded through everywhere: `OUTBOUND_TOOL_NAMES`, the
+    `staff_note` default-deny set, outbound dispatch, and the journal `toolName`.
+  - **`consult_staff`** — new. A first-class agent→staff directed-messaging tool
+    (`lane: 'both'`). Addresses one or more colleagues by userId or display name,
+    writes the note with resolved `staff:<userId>` mentions, and is available on
+    both conversation and standalone wakes.
+  - **`add_note`** — `mentions` removed. Now purely an undirected timeline
+    breadcrumb: no recipient, no notification.
+
+  Staff-token resolution (userId / `user:<id>` / display-name → `staff:<userId>`,
+  with a deterministic roster error on unresolved tokens) is extracted into
+  `modules/messaging/tools/lib/resolve-staff-mentions.ts`, shared by `consult_staff`.
+
+  ## Two co-equal threads, not one primary file
+
+  `MESSAGES.md` and `INTERNAL-NOTES.md` are now framed as two threads of one
+  conversation with equal standing. `conversationSideLoad` pushes unaddressed
+  staff-thread content into the prompt — when a staff note is newer than the
+  agent's last action, the staff thread becomes as unmissable as the customer
+  transcript instead of a file the agent has to choose to read. The per-turn Task
+  instruction is reframed from "respond to the customer now" to a two-audience
+  frame: check the staff thread first, then reply to the customer grounded in what
+  was read.
+
+  Prompt and wake-cue text across `messaging/agent.ts`, `wake/trigger.ts`, and the
+  `update_contact` / `conv reassign` / `team list` / agent-seed prose is updated to
+  point at `consult_staff` instead of `add_note` + `mentions`, and to describe the
+  workspace in workspace terms rather than framework internals.
+
+  ## Follow-ups
+
+  - `consult_staff` writes the note + mentions but does not itself fire the staff
+    WhatsApp/in-app notification — that fan-out (`fanOutNoteMentions`) currently
+    only runs from the HTTP notes handler, not the agent write path. This is
+    pre-existing behaviour inherited from `add_note` + `mentions`; wiring it into
+    the agent path is tracked separately.
+  - Agent-facing prompt vocabulary still says "customer" in places; aligning it to
+    the tenant-agnostic "contact" is a separate sweep.
+
+### Patch Changes
+
+- [`fdfe8c8`](https://github.com/vobase/vobase/commit/fdfe8c80b2066f9427917157f14e5cb2bf82ac45) Thanks [@mdluo](https://github.com/mdluo)! - feat(auth, team): serial anonymous visitor names + phone-number plugin for staff
+
+  ## Anonymous visitor names
+
+  The better-auth `anonymous` plugin now names fresh public-chat sessions with a
+  per-day serial — "Visitor B001", "Visitor B002", … — instead of a random id,
+  so staff see a stable handle in the inbox. The counter is a gap-free sequence
+  (core's `infra.sequences` table) with a day-of-week letter prefix that resets
+  daily in the deployment timezone.
+
+  ## Staff phone via the phone-number plugin
+
+  Adds the better-auth `phone-number` plugin and removes the hand-crafted
+  `staff_profiles.whatsapp_phone_e164` column. Staff phone numbers now live on
+  the better-auth `user` table (`user.phone_number`):
+
+  - The team staff service joins the phone in on read and writes it to the
+    `user` row on create/update; a unique-collision surfaces as a typed 409.
+  - `mention-notify`, `staff-link-sync`, the WhatsApp staff-reply router, and the
+    standalone-wake notification mirror all read the phone from the `user` table.
+    The platform staff-link wire shape is unchanged.
+  - The invite dialog gained an optional phone field — it rides the invitation
+    row (org-plugin `additionalFields`) and is copied onto the user at sign-in.
+  - The staff profile form keeps an editable phone field.
+
+  Phone-based sign-in is **not** enabled — the plugin's `sendOTP` is a stub seam
+  for a future SMS/WhatsApp OTP sender.
+
+## 3.12.0
+
+### Minor Changes
+
+- [`f647ed9`](https://github.com/vobase/vobase/commit/f647ed9f22ef2b1f22a757c8d39c3612b0128f72) Thanks [@mdluo](https://github.com/mdluo)! - refactor(template): adopt platform contract v3 + runtime org-id resolution
+
+  Bumps `PLATFORM_TENANT_CONTRACT_VERSION` to `v3` and removes the hardcoded
+  organization-id constant that module seeds and tests relied on.
+
+  ## platform contract v3
+
+  - The claim and webhook-register wire bodies no longer carry
+    `channelInstanceId` or `environment`. Channel-instance identity is now
+    purely tenant-side state.
+  - On webhook registration the platform mints an `endpointId`, which the
+    tenant persists on `channel_instances.config` and encodes into the
+    single-arg `/link <endpointId>` QR. The managed re-verify path refreshes
+    it in place.
+  - `handshake.ts` claim/release calls send empty bodies; the canonical
+    managed-config type gains an optional `endpointId` field.
+
+  ## runtime org-id resolution
+
+  - The seed orchestrator (`scripts/seed.ts`) inserts the `auth.organization`
+    row first and threads its id to every module seed, instead of each seed
+    reading a compile-time constant. The id comes from `PLATFORM_TENANT_ID`
+    on real deploys, or a fresh nanoid for a bare `db:reset`.
+  - Tests resolve the id at runtime via the new `getSeededOrgId` helper
+    (earliest `auth.organization` row); live smokes use `getSmokeOrgId`,
+    which also honours an optional `ORG_ID` override.
+
+  ## managed-channel row UI
+
+  - Drops the redundant "Platform sandbox" mode chip for managed channels —
+    the display name already states the type.
+  - Hides the "Open in Meta WABA Manager" action for managed channels, which
+    have no tenant-accessible Meta Business surface.
+
+### Patch Changes
+
+- [`afee068`](https://github.com/vobase/vobase/commit/afee06843a981ee8a2d3261d64b49b3dbe50f6f6) Thanks [@mdluo](https://github.com/mdluo)! - refactor(auth): generate the auth schema via the better-auth CLI; adopt the official apiKey plugin
+
+  Fixes the bug where new tenant projects got the better-auth tables duplicated
+  into both the `auth` and `public` Postgres schemas.
+
+  ## core (breaking surface reduction)
+
+  Core ships infrastructure primitives, not app schema. The hand-written
+  better-auth drizzle schema, the `authPgSchema` export, the auth table exports
+  (`authUser`, `authSession`, …), and the unused `VerifyApiKey` / `CreateApiKey`
+  / `RevokeApiKey` contract types are all removed from the public surface. The
+  `better-auth` / `@better-auth/api-key` peer deps are dropped — core has zero
+  runtime use of better-auth. App code now owns its auth schema in the template.
+
+  ## template
+
+  - **CLI-generated auth schema.** `bun run gen:auth` runs the pinned `auth` CLI
+    against `auth/auth.config.ts`, then rewrites the flat output into the vobase
+    shape: `auth` pg schema, timezone-aware timestamps, `defaultNow()` on
+    created/updated columns. Output splits into `schema-tables.ts` (native names,
+    drizzle-kit reads this) and `schema.ts` (re-export + `auth`-prefixed aliases,
+    app code reads this) so each table registers exactly once. `auth/plugins.ts`
+    is the single source of truth for the schema-contributing plugin set, shared
+    by the runtime and CLI-introspection configs so they can't drift.
+    `check:auth-schema` guards this in CI.
+  - **Official `apiKey` plugin.** The custom API-key service is replaced by
+    `@better-auth/api-key`. A valid `Authorization: Bearer vbt_<key>` mocks a
+    session, so the CLI catalog/dispatch routes and `/api/auth/whoami` resolve
+    through the standard session → org → role middleware chain — one auth path
+    for cookie and bearer callers alike.
+
+- Updated dependencies [[`afee068`](https://github.com/vobase/vobase/commit/afee06843a981ee8a2d3261d64b49b3dbe50f6f6)]:
+  - @vobase/core@0.43.0
+
+## 3.11.4
+
+### Patch Changes
+
+- [`b14ba38`](https://github.com/vobase/vobase/commit/b14ba385c8f656780a60181d46b39b660ff1d56d) Thanks [@mdluo](https://github.com/mdluo)! - fix/feat(wake, messaging, channels, drive, ui): backport batch from downstream tenant
+
+  Ten changes rolled up from a production tenant where each was verified against
+  live agent traffic. Grouped by area:
+
+  ## wake (staff-note safety)
+
+  1. **Customer-facing tools dropped on peer-consult wakes; self-anchor against
+     duplicate sends.** Back-to-back `staff_note` wakes were re-firing the same
+     customer card across multiple turns even when the cue said "do NOT call
+     send_card" — soft instructions lost to in-context pattern pressure. When
+     `triggerKind=staff_note` AND `assignee ≠ agent:<self>`, `reply` /
+     `send_card` / `send_file` / `book_slot` are now dropped from the lane tool
+     set (hard guarantee, filter propagates to both runtime registry and the
+     AGENTS.md tool guidance). A new `selfActivity` snapshot in
+     `wake/unread-activity.ts` renders agent-role messages and agent-authored
+     self-notes since the last customer/staff inbound as "Your recent actions
+     (already done, do not re-send)" in the cue appendix — gives the LLM a
+     concrete "I already sent this" anchor for the agent-is-assignee case.
+     `renderStaffNote` tightened in both branches.
+
+  2. **Default-deny customer tools on ALL staff_note wakes.** Soft constraints
+     (prompt prose, self-anchor, cue text) repeatedly failed to break the
+     dominant in-context pattern even when the agent had just self-noted that
+     it would stay silent. Generalised the change above: `reply` / `send_card`
+     / `send_file` / `book_slot` are now dropped for every `staff_note` wake,
+     not just peer-consults. When staff genuinely want the agent to message the
+     customer, they reply through the channel themselves (Reply composer) or
+     wait for the next inbound. `renderStaffNote` unified around the new
+     unconditional rule.
+
+  3. **`send_card` / `reply` prompts tightened.** Tool descriptions now spell
+     out that they should NOT fire reflexively on every wake — only when the
+     wake's actual ask warrants a customer-facing reply. Pairs with the
+     default-deny gate above for staff_note wakes where the tool is also
+     physically removed.
+
+  ## messaging
+
+  4. **Legacy `book_slot` stub removed.** The placeholder tool returned
+     `{slotId, confirmed: true}` without writing any appointment row, leading
+     to hallucinated bookings the agent would confidently confirm in chat.
+     References removed from `messaging.agent.ts` (tool roster + AGENTS.md
+     prose), `wake/conversation.ts` default-deny set, `wake/trigger.ts`
+     peer-consult + staff-note prose, and the e2e tool-surface fixture. The
+     `agent_definitions.book_slot_approval_required` column is left intact
+     (removing it needs a migration). `tests/e2e/system-hash-snapshot.test.ts`
+     `SYSTEM_HASH_FIXTURE` will need refreshing on next run against the new
+     tool surface.
+
+  ## channels (whatsapp)
+
+  5. **Managed claim flow surfaces platform 4xx as `409`, not `502`.** Meta's
+     platform-claim endpoint returns structured 4xx codes (number already
+     claimed, app not approved, etc.); the adapter was bucketing all of them
+     into 502 "upstream error", masking actionable failures from the UI.
+     Pass-through now preserves the original status so the operator sheet
+     shows the correct error.
+
+  6. **Staff-notification claim flow wired end-to-end.** The "staff is here,
+     please notify them" claim path through WhatsApp managed channels now
+     threads from inbound parse → claim handshake → realtime fanout, with
+     factory + registry + bootstrap + handshake all updated. Connect-managed
+     sheet UI shows the new state. Resolves the previously dangling case
+     where the agent could request staff handoff but the notification never
+     landed.
+
+  ## drive
+
+  7. **Text-only rows unstick from "Indexing"; `drive upload --file=` works
+     from remote tenants.** Two coupled bugs:
+     - `writePath`, proposal-materializer's `upsertFile`, and seed inserts
+       defaulted to `extraction_kind='pending'` and sat on the "Indexing"
+       pulse forever (no bytes to extract). All three paths now land rows at
+       `(ready, extracted)` via a shared `TEXT_WRITE_LIFECYCLE` constant in
+       `drive/state.ts`; re-stamping on overwrite recovers any row a prior
+       `reextract` flipped to `(failed, failed)`.
+     - The legacy `drive upload --path=<local>` verb resolved the path on
+       the SERVER's filesystem — broken for remote tenants. New
+       `--file=<local-path>` flag reads on the operator's machine
+       (`packages/cli` resolver base64-encodes + ships as `fileBytes` +
+       `filename`); decoded server-side in the verb. `--path=<server-path>`
+       retained for the agent's in-process bash sandbox.
+     - `reextract` now refuses storage-keyless rows with an actionable error
+       pointing at `drive write` / `drive propose` / `drive upload --file`.
+     - `vobase-cli-ops` skill doc updated for the new convention (verb table,
+       gotcha row, decision table, path-trap example).
+
+  ## ui
+
+  8. **Drive sidebar brand reads from `VITE_PRODUCT_NAME`.** Was hardcoded
+     to `'VOBASE'` — for white-label deployments it should match the same
+     env var as the page title + auth layout. Falls back to `'Vobase'` when
+     unset.
+
+  9. **Team member name inferred from email when not set; row stays
+     clickable when name is empty.** New `auth/display-name.ts` helper
+     threaded through the dev-plugin and the principal directory; the team
+     list and detail page now degrade gracefully for rows where the
+     `name` column was never populated.
+
+  10. **Markdown patch diffs wrap long lines.** `<DiffView>` was clipping
+      long single-line patches off the right edge of the changes panel;
+      `whitespace-pre-wrap` lets the line break at the panel width.
+
+## 3.11.3
+
+### Patch Changes
+
+- [`b8df432`](https://github.com/vobase/vobase/commit/b8df432b5acfb6c1d1ee2c8cde4433b525e7b62c) Thanks [@mdluo](https://github.com/mdluo)! - fix(messaging): inbox now refreshes on customer inbound + optimistic staff reply
+
+  Two inbox UX gaps:
+
+  1. **Customer messages didn't surface until the agent replied.** The web
+     adapter already fanned out an SSE `notifyConversation` post-write
+     (`adapters/web/handlers/inbound.ts`), but the generic
+     `modules/channels/service/inbound.ts` — used by every other adapter,
+     including WhatsApp — did not. The staff inbox then waited on the wake's
+     own `tool_execution_end` notify, which could be seconds away (and never
+     fires if the agent no-ops). Added the same post-write
+     `notifyConversation(result.conversation.id)` call to the generic
+     inbound path so every channel surfaces customer messages immediately.
+
+  2. **No optimistic update when replying from the inbox.** `useStaffReply`
+     only invalidated `['messages', …]` `onSuccess`, so the staff bubble
+     appeared only after the server roundtrip. The hook now prepends a
+     sentinel `Message` (id: `optimistic-${ts}`, status: `'sending'`,
+     metadata: `{ optimistic: true }`) on `onMutate`, restores the snapshot
+     on error, and invalidates on `onSettled` so the real row replaces the
+     sentinel as soon as the server response arrives.
+
+- [`845d0f7`](https://github.com/vobase/vobase/commit/845d0f75fc7c0fdf0f11fee42980f86c34de9eba) Thanks [@mdluo](https://github.com/mdluo)! - fix(messaging): suppress SSE messages refetch during pending staff-reply
+
+  The optimistic reply bubble appeared correctly on `onMutate`, but the
+  SSE-driven `conversations`-table notify (fired by the reply handler's own
+  `notifyConversation`) raced the mutation's HTTP response: the resulting
+  `['messages', conversationId]` refetch replaced the optimistic row with
+  the persisted one mid-flight. Because the optimistic id (`optimistic-…`)
+  differs from the server-issued id, React re-keyed the row, AI-elements
+  `Conversation` (`use-stick-to-bottom`) observed the resize, and the
+  bubble visibly bounced with a one-frame gap.
+
+  - `useStaffReply` now sets `mutationKey: ['staff-reply', conversationId]`
+    (exported as `STAFF_REPLY_MUTATION_KEY`).
+  - `useRealtimeInvalidation` checks
+    `isMutating({ mutationKey: ['staff-reply', payload.id] })` before
+    invalidating `['messages', payload.id]` on a `conversations` notify,
+    deferring to the mutation's own `onSettled` for the final reconcile.
+
+- [`552d47d`](https://github.com/vobase/vobase/commit/552d47dc1729107e7cc040134e600e14f1d7e099) Thanks [@mdluo](https://github.com/mdluo)! - fix/feat(wake, messaging, realtime, channels): backport batch from downstream tenant
+
+  Sixteen changes rolled up from a production tenant where each was
+  verified against live agent traffic. Grouped by area:
+
+  ## wake/learning (triage)
+
+  1. **Resolved model id passed to triage LLM.** Triage was passing the
+     bare alias key `gpt_mini` as `LlmRequest.model`; `createModel`
+     expects the fully-qualified `provider/model` id, so the lookup
+     silently fell back to `DEFAULT_CHAT_MODEL` (Sonnet), defeating the
+     cheap-model triage. `thresholds.ts` now hardcodes `triageModel` to
+     `models.gpt_mini`; `triage-prompt.ts::shouldStubTriage` switches on
+     the `openai/` / `anthropic/` / `google/` provider prefix.
+
+  2. **Triage drop log + prompt clarity.** A `self_reflection` signal
+     dropped with confidence 0.97 read like a threshold bug, but
+     `worth_attention` is the gate and `confidence` is the LLM's
+     certainty about that classification — a confident "no" is also
+     high confidence. Log line now spells out
+     `worth_attention: false`. Dropped the contradictory "if not worth
+     attention then confidence ≤ 0.2" instruction from the system
+     prompt and added a signal-interpretation block: for
+     `self_reflection` the journal activity is the signal, while for
+     `staff_takeover` / `coexistence_echo` / `coaching_note` /
+     `rejection` the `signalBody` is the signal.
+
+  3. **Expanded triage LLM context.** The cheap-model triage was running
+     with a 10-row text-only journal, no contact memory, and no
+     agent-role description. Now pulls `agent_definitions.instructions`
+     (head 300 chars), wires `contactMemoryHead` via `conversations` →
+     `contacts.memory`, appends `toolName` + `toolCalls` + `payload`
+     from `conversation_events`, bumps the journal window 10 → 20 rows
+     and truncation 2000 → 4000 chars. The three context queries run
+     in parallel via `Promise.all`. Sub-cent per triage on `gpt_mini`.
+
+  4. **`journalContext` sourced from `messaging.messages`.** The triage
+     prompt's journal was reading `harness.conversation_events`, which
+     only contains wake harness events and conversation lifecycle rows
+     — the actual customer/staff/agent message bodies live in
+     `messaging.messages`. Replaced the query and rendered each row via
+     the canonical `summarizeMessageContent` (matching `vobase
+messaging messages` and the unread-activity preamble).
+
+  ## wake (conversation cue + debounce)
+
+  5. **Unread activity inlined into conversation-lane wake cues.** Wakes
+     now carry an activity preamble (customer messages, staff notes,
+     internal events) so the agent sees what happened during its
+     absence without a separate tool call.
+
+  6. **Trigger leads, activity is appendix.** When a `staff_note` wake
+     fired alongside customer frustration messages from the prior wake,
+     the unread-activity preamble landed above the trigger cue and the
+     agent attended to the customer pile first. Flipped the cue order:
+     trigger first, `---`, then the activity block.
+
+  7. **Inbound bursts debounced to one wake per conversation.** Multiple
+     inbound messages arriving in quick succession used to each enqueue
+     a wake; only the first now wins until the wake drains, the rest
+     are coalesced via a state-machine update in `channels/service/state.ts`.
+     New live smoke: `tests/smoke/smoke-debounce-live.ts`.
+
+  ## messaging
+
+  8. **Staff-note actions described as composable in AGENTS.md.** The
+     routing table presented its bullets as mutually exclusive paths,
+     so the agent picked one ("relay") and stopped — needing three
+     subsequent prompts to coax a memory write. Intro now names the
+     dual nature of brief staff answers; step 2 heading notes that
+     more than one bullet often applies.
+
+  9. **Staff "mine" alignment scoped to the actual sender.** Message-thread
+     alignment was using `directory.staff[0]` as the implicit "me",
+     causing every staff message to right-align for every staff viewer.
+     Now matches against the resolved viewer id.
+
+  10. **Staff author matched from `[Name]` prefix, not
+      `directory.staff[0]`.** New `messaging/lib/staff-prefix.ts` parses
+      the bracketed name prefix; `staff-reply.ts` and
+      `message-thread.tsx` consume it for both write and render.
+
+  ## realtime
+
+  11. **`safeNotify` helper consolidates notify try/catch.** `runtime/index.ts`
+      now exports `safeNotify`; `contacts`, `team`, and `agents` services
+      use it instead of inline try/catch blocks around `pg_notify`.
+
+  12. **Inbox names refresh live; ownership filter labels resolve.**
+      `agents`/`team` modules now declare realtime keys for their
+      principal rows; `use-realtime-invalidation.ts` maps them so the
+      conversation list and ownership filter relabel without a manual
+      refresh.
+
+  ## channels (web adapter)
+
+  13. **"Open" button on web-channel table rows.** New
+      `channels/components/chat-url.ts` derives the public `/chat/<id>`
+      URL; the row menu and details sheet expose it.
+
+  14. **Public `/chat` page no longer sticks on "Assistant is thinking…".**
+      The web adapter's `messages` handler now emits a turn-end event
+      the chat page consumes; `wake/workspace/create.test.ts` updated.
+
+  ## runtime
+
+  15. **Request logger dropped to debug and off in production.** Hono
+      logger was at info; in production it spammed access logs without
+      adding signal. Set to debug, env-gated off in production.
+
+  ## docs
+
+  16. **`vobase-cli-ops` skill** — `--local` version floor, auth
+      troubleshooting, drive verb notes. (Shared skill — already in sync
+      at the repo root, no template change.)
+
+## 3.11.2
+
+### Patch Changes
+
+- [`421ec4d`](https://github.com/vobase/vobase/commit/421ec4dfa41ef3ad79e430eadf9590c81bcdd57f) Thanks [@mdluo](https://github.com/mdluo)! - fix(template/channels): release sandbox via managed endpoint + soft-delete instead of hard
+
+  Releasing a sandbox WhatsApp channel from the UI returned 500 because the
+  WhatsApp row menu's delete button called the generic
+  `DELETE /api/channels/instances/:id` — which doesn't release the
+  platform-side `managed_whatsapp_channel_claims` row, and hits
+  `fk_conv_channel_instance` (`ON DELETE RESTRICT`) the moment a conversation
+  has routed through this channel. The intent in the existing dialog copy is
+  already "Existing conversations are preserved but no new messages will be
+  received", so this switches the contract to soft-delete:
+
+  - `service/instances.ts::remove` now flips `status` to a new
+    `RELEASED_STATUS = 'released'` sentinel instead of hard-deleting.
+    `list()` filters those rows out so they neither surface in the channels
+    listing nor short-circuit the managed-claim idempotency probe.
+  - `channel-row-menu.tsx` dispatches managed channels to the dedicated
+    `DELETE /api/channels/whatsapp/managed/:instanceId` so the platform
+    claim release runs before the tenant-side soft-delete; self channels
+    still use the generic path (now also soft-delete).
+
+- [`5a417f4`](https://github.com/vobase/vobase/commit/5a417f46308dd8d3621649eb1e854ae984dbcab2) Thanks [@mdluo](https://github.com/mdluo)! - fix(template/whatsapp): write `agent:<id>` (not bare id) as the sandbox channel's default assignee
+
+  The managed-WhatsApp claim handler was writing the bare `agentDefinitions.id`
+  into `channel_instances.config.defaultAssignee`, but the canonical principal
+  token format used by every other writer (`modules/contacts/seed.ts`, the web
+  instance create form), every reader (`<Principal id=…>`, mention rendering,
+  hover cards), and the `conversations.assignee` column itself (via
+  `initialAssignee` in `dispatchInbound`) is `agent:<id>`. The mismatch showed
+  up in the channels table as a raw 8-character id instead of the agent's
+  name, and would also have broken assignee resolution on the first inbound
+  message after claim.
+
+  The one downstream reader that strips the `agent:` prefix to do a DB lookup
+  (`web/service/instances.ts` → `loadHydrationFor`) now strips it uniformly
+  from both the conversation's assignee and the instance's defaultAssignee,
+  so the seed flow (`defaultAssignee: 'agent:agt0meri0v1'`) keeps working.
+
+- [`46bd416`](https://github.com/vobase/vobase/commit/46bd41623b8a904f97aadf05808e786ce62a9e1c) Thanks [@mdluo](https://github.com/mdluo)! - fix(template/whatsapp): derive sandbox-claim environment from STAGING env, not NODE_ENV
+
+  The Dockerfile pins `ENV NODE_ENV=production` for every tenant container,
+  so a staging Railway deployment running `NODE_ENV=production` was claiming
+  a `production`-tier sandbox channel — the link message rendered
+  `mgd-<orgId>-production` even on the staging URL. The platform's
+  `set-staging-env-vars` step already stamps `STAGING=true` only on staging
+  Railway environments (production leaves it unset), so the tenant now reads
+  that flag to pick `production | staging` for `/managed/claim`. The
+  resulting `(tenant, environment, channelInstanceId)` key — and the
+  platform-pool slot it allocates — now corresponds to the deploy
+  environment the user is sitting in.
+
+- [`096a317`](https://github.com/vobase/vobase/commit/096a3179e172a17ed611c607ec58a022e723b40e) Thanks [@mdluo](https://github.com/mdluo)! - fix(whatsapp): use tenant slug, not nanoid, for webhook verify-token derivation
+
+  The sandbox-claim flow's earlier `X-Tenant-Id` fix correctly switched the
+  platform-call header to `PLATFORM_TENANT_ID` (the nanoid), but also accidentally
+  passed the nanoid as `tenantSlug` into `deriveVerifyToken`. The WhatsApp adapter's
+  GET hub-challenge handler derives the expected token from
+  `VITE_PLATFORM_TENANT_SLUG` (the human slug), so the two HKDF derivations
+  disagreed. Platform's webhook self-registration GET hit the tenant URL with the
+  wrong `hub.verify_token`, got 403, and surfaced in the UI as
+  "platform webhook registration failed (400: http_403)".
+
+  Threaded `tenantSlug` through `PlatformCreds` and use it for verify-token
+  derivation on both `/managed/claim` and `/managed/:id/webhook/re-verify` paths.
+  `X-Tenant-Id` continues to use the nanoid via `tenantId`.
+
+## 3.11.1
+
+### Patch Changes
+
+- [`9eefb19`](https://github.com/vobase/vobase/commit/9eefb19a00207c19a77e53dd301a576eaa399ead) Thanks [@mdluo](https://github.com/mdluo)! - # Tenant deploy back-ports from `a fresh tenant`
+
+  Three pre-existing template bugs that bricked every fresh tenant's first Railway deploy. Surfaced while bootstrapping `a fresh tenant`; fixes verified on its staging environment before being back-ported here. No tenant code is required to consume these — fresh deploys just work.
+
+  ## Tenant template (`@vobase/template`)
+
+  ### `scripts/db-migrate.ts` + `Dockerfile` — migrations actually run on Railway
+
+  - `scripts/db-migrate.ts` looked for `drizzle/meta/_journal.json`, a pre-1.0 drizzle-kit path that drizzle 1.0 no longer writes (journal lives in the `__drizzle_migrations` DB table). The check always failed → silent exit 0 → preDeployCommand `bun run db:migrate` claimed success without creating any tables. Now scans for any `drizzle/<ts>_<name>/migration.sql`, matching what `db:generate` actually produces.
+  - `Dockerfile` runtime stage didn't `COPY` the `drizzle/` directory, so even with correct detection the migration SQL wasn't present in the container. Added `COPY --from=build /app/drizzle ./drizzle` next to the other source dirs.
+
+  Combined, these two make `bun run db:migrate` on Railway preDeploy actually apply committed migrations. Without them every `/api/auth/*` route 500s on the first request because `auth.user` doesn't exist yet.
+
+  ### `modules/channels/adapters/whatsapp/*` + `modules/team/service/staff-link-sync.ts` — outbound HMAC reaches the platform
+
+  - `handlers/managed.ts` (lines 65, 92), `factory.ts` (line 243), and `staff-link-sync.ts` (line 115) sent `VITE_PLATFORM_TENANT_SLUG` as `X-Tenant-Id`. The platform verifies by `tenants.id` (an immutable 12-char nanoid), not by slug, so verification always missed and the platform silently fell through to its anonymous `{ok: true}` response. The tenant then read that as an auth failure and returned 502 on every signed surface — `/api/channels/whatsapp/managed/availability`, sandbox claim, staff-link sync.
+  - Switched all four sites to `process.env.PLATFORM_TENANT_ID`, which the platform's provisioning job already stamps alongside `PLATFORM_TENANT_SLUG`. The slug stays where it legitimately belongs: `deriveVerifyToken` (both ends of the WhatsApp webhook verify derivation must agree on the slug) and per-managed-channel records keyed by `tenant_slug`.
+
+  ## Workspace dependencies (`@vobase/core`, `@vobase/cli`, `create-vobase`)
+
+  - `drizzle-orm`/`drizzle-kit` aligned at `^1.0.0-rc.2` across `packages/template`, root, and `create-vobase` (`@vobase/core` was already there). Beta-era drizzle-kit produced a snapshot but never wrote `meta/_journal.json`, which is the bug that made the silent-skip path above so durable.
+  - Linked-packages config bumps `@vobase/core`, `@vobase/cli`, and `create-vobase` in lockstep with the dep alignment; no functional changes in those packages.
+
+  ## Known follow-up (not blocking this change)
+
+  drizzle-kit `1.0.0-rc.2` generates invalid SQL for `tsvector GENERATED ALWAYS AS … STORED` columns in its `ALTER COLUMN` path, which trips `db:reset → drizzle-kit push` against `drive.chunks.tsv`. Pre-existing customType usage in `packages/template/modules/drive/schema.ts`. Tests that exercise `db:reset` are blocked on a separate fix (schema reshape or drizzle-kit patch); the deploy path here uses `db:migrate` and is unaffected.
+
+- Updated dependencies [[`9eefb19`](https://github.com/vobase/vobase/commit/9eefb19a00207c19a77e53dd301a576eaa399ead)]:
+  - @vobase/core@0.42.1
+
+## 3.11.0
+
+### Minor Changes
+
+- [`44bb9a1`](https://github.com/vobase/vobase/commit/44bb9a1af944767ca8925301b8f5e113cd200a46) Thanks [@mdluo](https://github.com/mdluo)! - # Staff WhatsApp number entry + display in the team UI
+
+  Wires up the missing UI for Slice 3's notification-tier reconciler: the backend already accepted `staff_profiles.whatsapp_phone_e164` since US-021 and the reconciler synced it to platform staff-links, but the team UI had no way to enter or view the number.
+
+  ## Tenant template (`@vobase/template`)
+
+  - **`team/components/staff-form-dialog.tsx`** — new "WhatsApp number" input below Languages. Validates E.164 with leading `+` (`^\+[1-9]\d{6,14}$`) inline; empty clears the column.
+  - **`team/pages/$userId.tsx`** — new "WhatsApp" row in the Profile InfoCard (monospace number or `—`); patches `whatsappPhoneE164` through to the existing `PATCH /api/team/staff/:userId` handler so the reconciler enqueue fires.
+  - **`team/pages/index.tsx`** — new sortable + text-filterable "WhatsApp" column in the staff list, between Languages and Capacity.
+  - **`team/hooks/use-staff.ts`** — `UpsertStaffBody` type extended with optional `whatsappPhoneE164` so the typed RPC client accepts the field.
+
+  No backend changes — the handler, schema column, and reconciler already shipped in Slice 3.
+
+  ## Other packages
+
+  - `@vobase/core`, `@vobase/cli`, `create-vobase` — no functional changes; linked-packages config bumps them in lockstep with `@vobase/template`.
+
+### Patch Changes
+
+- Updated dependencies [[`44bb9a1`](https://github.com/vobase/vobase/commit/44bb9a1af944767ca8925301b8f5e113cd200a46)]:
+  - @vobase/core@0.42.0
+
+## 3.10.0
+
+### Minor Changes
+
+- [`4bfa583`](https://github.com/vobase/vobase/commit/4bfa583553c50092ef7ca917059bed1d98d224af) Thanks [@mdluo](https://github.com/mdluo)! - # Slice 2.5 + Slice 3 — Notification kind end-to-end, registry-driven managed channels, staff-link reconciler
+
+  Lands the notification-tier work as a single coordinated drop. Wire contract bumps `v1 → v2` between the tenant template and `vobase-platform` (see `packages/template/contracts/version.ts` + `packages/template/CONTRACTS.md`). Architect-approved + deslop + post-review simplification all included.
+
+  ## Highlights
+
+  - **Notification channel kind** added to the managed-channels registry alongside `sandbox` (`packages/template/modules/channels/managed/registry.ts`). Per-tenant-env cap of 1 enforced via registry, not DB (no partial unique).
+  - **Parameterized handshake helpers** `claim(kind)` / `release(kind)` / `staffLinks.{upsert,delete,list}` replace the ad-hoc `*Notification*` shape (`packages/template/modules/integrations/service/handshake.ts`). Single `signedPlatformRequest` consolidates the three legacy `signedPlatformPost/Delete/Get` variants.
+  - **`inbound-router.ts`** (142 LOC) replaces the legacy 300-LOC `notifications-inbound.ts` and the 338-LOC `whatsapp-notification.ts` from the archived stash. Dispatches via `entry.inboundDispatch` (no per-kind switch in the router); staff-reply branch does ask-staff-answer (`claimPing → addNote → existing mention fan-out`) with operator-thread fallback via `defaultOperatorAgentId` → oldest enabled `agent_definitions` row (§7.8).
+  - **Generic `ConnectManagedChannelSheet`** replaces the kind-specific notification sheet — typed `kind→client` mapping eliminates the prior `as unknown as Record<...>` casts.
+  - **Staff-link reconciler** (`packages/template/modules/team/service/staff-link-sync.ts`) — single-options API + discriminated-union result (`{ kind: 'skipped' | 'applied' }`). Parallel upserts/deletes within each job. Pg-boss job `team:sync-staff-link` (`retryLimit=7`, `retryBackoff`, `singletonKey: 'staff-link-sync:<orgId>'`, `singletonHours=1/60` for R9-E rate-limit) + daily `0 3 * * *` UTC cron fanout for orgs with any `whatsapp_phone_e164`.
+  - **PATCH staff phone** in `team/handlers/index.ts` now enqueues the reconciler instead of inline platform calls.
+  - **New tables** (auto-generated migration, gitignored per template convention): `team.pending_mention_pings`, `settings.org_settings`, `team.staff_profiles.whatsapp_phone_e164`. `integrations.secrets` CHECK constraint on `vault_provider` dropped (§4.5).
+  - **Pre-migration audit** script `scripts/check-staff-phone-duplicates.ts` exits non-zero on duplicate `(whatsapp_phone_e164, organization_id)` rows — R9 Scenario G mitigation.
+  - **Three new e2e tests**: `staff-in-two-orgs.test.ts`, `kind-aware-allocator-cap.test.ts`, `reconciler-after-platform-outage.test.ts`.
+
+  ## Companion platform changes (vobase-platform, deploys in lockstep)
+
+  `PLATFORM_TENANT_CONTRACT_VERSION` bumped to `'v2'` on both sides. Platform additions (live in the separate `vobase/vobase-platform` repo):
+
+  - New `managed_whatsapp_staff_links` table + `kind` columns on `managed_whatsapp_channels` + `managed_whatsapp_channel_claims`. ADD COLUMN / CREATE TABLE only — no DROPs.
+  - Registry expanded with `notification` entry (`perTenantEnvCap: 1`, `challengeProtocol: 'whatsapp_notif'`).
+  - New `/notification/claim`, `/notification/release`, `/staff-links` routes (existing `/sandbox/...` routes unchanged).
+  - `lib/verify-tenant-signature.ts` reads `ROUTE_SIGNATURE_SCOPES` from `modules/managed-whatsapp/route-scopes.ts` (first-match, fail-closed) instead of the prior regex scope decision.
+  - `forwardToLinkedStaff` for inbound staff-reply forwarding (180 LOC, v2 HMAC, tenantEnvironments→Railway fallback).
+  - `findStaffLinkForInbound` JOIN-based lookup; `getNotificationPoolAvailable` parameterized via shared `poolAvailableFor` helper.
+  - `tx as any` casts eliminated via structural `MinimalQueryHandle` interface.
+  - Coordinated migration: see `vobase-platform/MIGRATION-COORDINATION.md` cutover log.
+
+  ## Operator handoff
+
+  See `packages/template/MIGRATION-COORDINATION.md` for the full pre-deploy checklist:
+
+  1. Run `bun run scripts/check-staff-phone-duplicates.ts` against each tenant DB (R9-G); operator deduplicates any hits before `db:migrate`.
+  2. Platform deploys first.
+  3. Tenant template picks up the new wire contract on next deploy.
+  4. `defaultOperatorAgentId` left nullable for existing orgs; inbound-router falls back to oldest enabled `agent_definitions` until an admin sets the picker.
+
+  ## Notes
+
+  - `@vobase/cli` and `create-vobase` bumps are coupled to `@vobase/core` per the linked-packages config; no functional changes to those packages in this slice.
+  - 6822 insertions / 368 deletions across 59 files in the tenant repo; 14 commits including post-architect deslop and post-review simplification.
+  - All grep gates clean: `defineModule`/`MANAGED_REQUIRE_SIG_V2`/`MAX_ALLOCATIONS_PER_TENANT_ENV`/inline `upsertStaffLinkOnPlatform`/`whatsapp-notification.ts`/`notifications-inbound.ts` all 0.
+  - Both repos' `bun run typecheck` + `bun run check` exit 0; tests baseline-equivalent (2 pre-existing throw-proxy guard fails on tenant unrelated to this slice).
+
+### Patch Changes
+
+- Updated dependencies [[`4bfa583`](https://github.com/vobase/vobase/commit/4bfa583553c50092ef7ca917059bed1d98d224af)]:
+  - @vobase/core@0.41.0
+
+## 3.9.0
+
+### Minor Changes
+
+- [`85ae97c`](https://github.com/vobase/vobase/commit/85ae97c254ba232042e7a447e68f1f1eef5fcfbb) Thanks [@mdluo](https://github.com/mdluo)! - feat(agents,messaging): admin-tier CLI verbs for live-tenant debugging
+
+  Adds a read-only debug surface so operators on remote deployments can diagnose agent behavior without direct DB access:
+
+  - `agents debug wakes --conversationId=<id>` — wake-by-wake summary (trigger, turns, tool calls, cost, `systemHash`, end reason). The `systemHash` column reveals frozen-snapshot drift across wakes.
+  - `agents debug timeline --wakeId=<id> [--full]` — per-wake event timeline from `harness.conversation_events` (turn*start, message*_, tool*dispatch*_, tool*execution*\*, llm_call, agent_end). Truncates content to 200 chars unless `--full`.
+  - `agents debug llm-io [--conversationId|--wakeId] [--seq=N:M] [--role] [--tool] [--limit] [--full]` — dump of `harness.messages` showing what pi-agent-core sent/received: user cues, assistant tool-calls with arguments, tool results, token + cost per row. `--wakeId` auto-derives the conversation and `agent_start..agent_end` time window.
+  - `messaging messages --id=<conv>` — staff-tier verb returning customer/agent/staff message bodies (complements `messaging show` which returns activity events but no bodies).
+  - `messaging notes --id=<conv>` — staff-tier verb that renders `INTERNAL-NOTES.md` byte-identical to the materializer the agent reads inside its bash sandbox.
+
+  All five verbs route through a new `DebugReadersService` (singleton + free-function wrappers, matching the agents-module convention) and respect organization scoping.
+
+### Patch Changes
+
+- [`3d42883`](https://github.com/vobase/vobase/commit/3d42883e2fb3b3a05d034ce90a446a76020a5ffb) Thanks [@mdluo](https://github.com/mdluo)! - fix(wake/build-base): route journal writes through `appendJournalEvent` wrapper
+
+  `buildJournalAdapter` called core's `journalAppend` directly, which only persists the reserved columns and drops every non-reserved AgentEvent field. As a result `agent_start.payload` landed as `null` and downstream debug surfaces couldn't recover `trigger`, `triggerPayload`, `systemHash`, or `agent_end.reason`. The template wrapper at `@modules/messaging/service/journal` auto-extracts those fields into the `payload` jsonb column — now used by every flavour.
+
+- [`632107e`](https://github.com/vobase/vobase/commit/632107ee8c80003be430ad7db62a597c57014414) Thanks [@mdluo](https://github.com/mdluo)! - fix(runtime/bootstrap): map better-auth `owner` role to `admin` audience tier
+
+  `getAudience` only checked `p.role === 'admin'`, so org owners (who outrank admin in better-auth's `owner > admin > member` hierarchy) were demoted to the `staff` audience tier and couldn't see admin-tier CLI verbs in the catalog. Both `owner` and `admin` now map to `'admin'`.
+
+## 3.8.3
+
+### Patch Changes
+
+- [`b50a3e3`](https://github.com/vobase/vobase/commit/b50a3e323a01637554d6cb5587902d362fa2b491) Thanks [@mdluo](https://github.com/mdluo)! - fix(wake/trigger): inline new-event body in inbound/staff-note/caption-ready cues
+
+  The wake-cue renderer for `inbound_message`, `staff_note`, and `caption_ready` was pointer-only — it told the agent "Read /contacts/<id>/INTERNAL-NOTES.md for context" rather than including the body itself. Models sometimes skipped the follow-up `cat`, replied from stale context, and (e.g.) ignored a staff note like "@MeriGPT yes we are" in favor of a generic "billing team will follow up" stall.
+
+  Producers now thread the latest body through the trigger payload (`channels/service/inbound`, two web-channel handlers, `messaging/service/notes` fan-out, `drive/jobs` + `drive/service/files`); the renderer inlines it as a markdown blockquote with an explicit "full thread in …" pointer to the materialized file. Mirrors the operator-thread renderer's existing blockquote pattern.
+
+  `truncateForCue` caps the inlined body at 4 KB UTF-8 on a line boundary (marker bytes pre-reserved so the returned string is guaranteed ≤ cap), matching the harness's 4 KB inline tool-stdout budget. All body fields are optional — legacy queue rows mid-deploy fall back to the original pointer-only cue.
+
+## 3.8.2
+
+### Patch Changes
+
+- Updated dependencies [[`84df3b9`](https://github.com/vobase/vobase/commit/84df3b959e9ec0b01fed74513052bd62ebde98b0), [`a9dc138`](https://github.com/vobase/vobase/commit/a9dc1385c5ee4ebee79e18c72b19995d5d984e75)]:
+  - @vobase/core@0.39.0
+
+## 3.8.1
+
+### Patch Changes
+
+- [`660dc2b`](https://github.com/vobase/vobase/commit/660dc2b06d1b69488609b339bc4ea43d7937c988) Thanks [@mdluo](https://github.com/mdluo)! - CLI npm publish prep + audience-tier-filtered catalog + version-skew handshake.
+
+  **`@vobase/cli`** — first time the npm-installed binary is safe to use against any Vobase deployment.
+
+  - **Bun preflight** in `bin/vobase.ts` exits `127` with an install hint when invoked under non-Bun runtimes. Paired with `engines.bun: ">=1.3.13"` in `package.json` so npm/bun warn at install time. (Caveat: the friendly-hint path can't fire when imports fail to resolve — Node will die on `ERR_MODULE_NOT_FOUND` first. The `engines` field + shebang are the load-bearing guards.)
+  - **Auto-JSON on non-TTY** (BREAKING for pipelines that previously parsed the human table). Precedence: `--json` > `--no-json` > `!process.stdout.isTTY`. Pipe `vobase contacts list | jq` and you get JSON. Pass `--no-json` to keep table output even when piped.
+  - **Version-skew warning** — when the server advertises a newer `clientLatestVersion`, the binary prints `[vobase] WARN: vobase ${installed} is behind ${latest}; upgrade with 'bun add -g @vobase/cli'` to stderr **once per process**. No persisted state. No `clientMinVersion` hard-fail.
+  - **Optional `version: 1` discriminator** in `ConfigSchema` — forward-compat marker for future schema migrations. v0 configs (no `version` field) and v1 configs both parse cleanly. No migration code, no multi-tenant rewrites — `--config <name>` already provides multi-tenancy via filename.
+  - `prepublishOnly` script gates publish on `typecheck && test`. `files` array now ships `README.md` + `CHANGELOG.md`.
+
+  **`@vobase/core`** — catalog endpoint stops leaking admin-tier verbs to non-admin callers, and surfaces a one-line server-side handshake field for older CLI binaries.
+
+  - `CliVerbRegistry.catalogFor(tier: AudienceTier)` filters via the existing `isVerbVisible` helper and memoises one entry per tier (max 3). Cache invalidates inside `register()`. Existing `catalog()` is now a back-compat shim over `catalogFor('admin')` — same shape, same etag for that tier.
+  - `createCatalogRoute` is now generic over `Env`: `createCatalogRoute<TEnv>({ registry, getAudience?: (c: Context<TEnv>) => AudienceTier, clientLatestVersion?: string })`. `getAudience` defaults to `'admin'` so existing uninstrumented callers continue to see the unfiltered catalog. `clientLatestVersion` is included in the JSON body when set, omitted otherwise — older clients ignore unknown fields.
+  - Removed the separate `cachedCatalog` field; per-tier memo is the single source of truth. `list()` now caches its sorted result and clears in `register()`.
+
+  **`@vobase/template`** — wires `getAudience` from the API-key principal's role and pins `CLI_LATEST_VERSION = '0.7.0'` at the catalog mount site. Anonymous → `'contact'`, authed non-admin → `'staff'`, `role === 'admin'` → `'admin'`. The 401 from the api-key middleware still blocks anonymous before the route handler runs; the `'contact'` fallback is defense in depth.
+
+- Updated dependencies [[`660dc2b`](https://github.com/vobase/vobase/commit/660dc2b06d1b69488609b339bc4ea43d7937c988)]:
+  - @vobase/core@0.38.0
+
+## 3.8.0
+
+### Minor Changes
+
+- [`8f376ea`](https://github.com/vobase/vobase/commit/8f376eac4a1512b68123b3828d74f83dfa2b3fd9) Thanks [@mdluo](https://github.com/mdluo)! - Learning loop slice 3: `agentskills.io` skill spec + signal × scope smoke coverage.
+
+  Aligns the learned-skill format with the public `agentskills.io` spec (frontmatter + body convention), updates the skill-emission path to write that shape, and adds smoke coverage exercising every `(signalKind, scope)` pair from the triage pipeline so the cheap-model classifier and the routing rules are tested as a matrix instead of as one happy-path scenario per signal.
+
+- [`8f376ea`](https://github.com/vobase/vobase/commit/8f376eac4a1512b68123b3828d74f83dfa2b3fd9) Thanks [@mdluo](https://github.com/mdluo)! - Migrate the change-proposal registry to sensitivity-driven routing.
+
+  Replaces the binary `requiresApproval` flag with a typed `Sensitivity` enum (`'low' | 'medium' | 'high' | 'critical'`). `insertProposal` now combines the agent-supplied `confidence` with the resource's effective sensitivity (resource-level + per-scalar + per-attribute) via `effectiveSensitivity()` and routes to one of three outcomes:
+
+  - `'drop'` — confidence below `T_REVIEW` (the trivia gate)
+  - `'pending'` — middle band, lands on `/changes` for human review
+  - `'auto_written'` — confidence ≥ `T_AUTO_BASE + sLevel × HEADROOM`
+
+  The auto bar is **additive** (`T_AUTO_BASE + sLevel × HEADROOM`), not multiplicative — a `'critical'` resource raises the auto threshold but never silences high-confidence proposals into `'drop'`. Calibration knobs (`T_REVIEW=0.3`, `T_AUTO_BASE=0.7`, `SENSITIVITY_HEADROOM=0.3`) and the level→number map (`low=0.2`, `medium=0.4`, `high=0.7`, `critical=0.95`) read from env at module load.
+
+  `MaterializerRegistration` gains optional `sensitivity`, `sensitivityForFields`, and `resolveAttributeSensitivities` fields; the five existing module registrations migrate to the new shape with their previous defaults preserved.
+
+- [`8f376ea`](https://github.com/vobase/vobase/commit/8f376eac4a1512b68123b3828d74f83dfa2b3fd9) Thanks [@mdluo](https://github.com/mdluo)! - Per-attribute sensitivity for tenant-defined contact fields.
+
+  `contact_attribute_definitions` now carries a `sensitivity` column (`'low' | 'medium' | 'high' | 'critical'`, default `'medium'`), and the contacts module wires `resolveAttributeSensitivities()` into the change-proposal registration. When a `field_set` payload touches `attributes.<key>`, the resolver looks up the per-key sensitivity and the routing layer combines it with the resource baseline via `effectiveSensitivity()` — so tenants can mark `attributes.tax_id` as `critical` without core code changes, and proposals routing reflects it automatically.
+
+  The settings UI gets a sensitivity picker on attribute definitions; the `/changes` inbox shows the effective sensitivity that drove the routing decision.
+
+- [`8f376ea`](https://github.com/vobase/vobase/commit/8f376eac4a1512b68123b3828d74f83dfa2b3fd9) Thanks [@mdluo](https://github.com/mdluo)! - Drive editor: render markdown frontmatter as a read-only table above the editable surface.
+
+  `drive/components/drive-markdown-editor.tsx` now ships the GFM-table plugin set plus a frontmatter splitter that pulls leading YAML out of skill / profile markdown and renders it as a read-only `PlateStatic` table. The raw frontmatter is preserved verbatim and re-prepended on save so the on-disk YAML stays byte-stable.
+
+  Also fixes the AGENTS.md preamble preview in `agents/components/agents-md-editor.tsx`: the editor now uses `createSlateEditor({ value })` (mutating `ed.children` after construction never propagated to the rendered tree). Collapsed view stays at `max-h-48` with the fade gradient; expanded drops the cap so the preamble flows into the parent scroll container.
+
+  `agents/handlers/definitions.ts` awaits `materialize()` and `renderPreviewAgentsMd` so the preamble route returns the rendered markdown instead of `[object Promise]`.
+
+- [`8f376ea`](https://github.com/vobase/vobase/commit/8f376eac4a1512b68123b3828d74f83dfa2b3fd9) Thanks [@mdluo](https://github.com/mdluo)! - Learning loop slice 2: agent-driven learning loop with triage pipeline.
+
+  Adds the cheap-model triage pre-filter that runs before any expensive learning operation (full distill, skill emission, memory rewrite). Triage classifies the signal, scopes it (`agent.agent_memory` / `team.staff_memory` / `contacts.contact_memory` / `agents.learned_skill`), and either drops, queues, or fans out to the matching observer. Drops never leave a row; queued candidates land in a typed table for staff visibility; auto-applied lessons go through the same `change_proposals` machinery as everything else, so confidence + sensitivity routing applies uniformly.
+
+  Wire-up: `wake/learning/triage.ts` runs as a post-wake job, and the existing learning observers (`coaching_note`, `staff_takeover`, `coexistence_echo`, `rejection`, `learned_skill`, `contact_memory`, `staff_memory`) now consume only triage-classified candidates. New `learning_candidates` table tracks pending vs consumed rows.
+
+### Patch Changes
+
+- [`426cef6`](https://github.com/vobase/vobase/commit/426cef6d6153e2adbf1600dcd8ce70feb235a216) Thanks [@mdluo](https://github.com/mdluo)! - Strengthen agent prompts for `send_card` and `learned_skill` capture.
+
+  **`MERIGPT_INSTRUCTIONS` (`modules/agents/seed.ts`)** — adds two sections derived from realistic-persona smoke findings:
+
+  - **Reply format** rule: when the customer has 2+ options to choose, compare, confirm, or act on (plans/pricing, refund decisions, booking slots, lists of choices), prefer `send_card` over `reply`. Cards let the customer one-tap their next move; `reply` is reserved for pure acknowledgements and free-form questions. Surfaces a discipline that was previously only documented per-tool.
+  - **Product / pricing / plan questions** rule: must `cat /drive/BUSINESS.md` and `cat /drive/pricing.md` before replying. The smoke caught the agent answering plan-comparison questions from memory, sometimes with stale information; this forces grounding in the canonical drive docs and pairs naturally with the new `send_card` rule.
+
+  **`learning-candidates-sideload.ts`** — replaces the hedged "rarely the right move" wording for `agents.learned_skill` candidates with a load-bearing rule: treat the candidate body as authoritative, capture verbatim, dismissal requires an explicit reason ("duplicates X" / "contradicted by Y"), replying without acting is wrong. The prior phrasing left enough room for the agent to ignore high-confidence skill candidates entirely — observed in smoke as a reply that consulted an unrelated skill, grep'd for context, then bailed without capturing the lesson.
+
+  After both changes the realistic-persona smoke went from 7/10 → 10/10 (with the `redeem-promo` skill captured at `auto_written` from the staff coaching note).
+
+- [`beb2f58`](https://github.com/vobase/vobase/commit/beb2f5850d8d4cb1a28d487c41cf028f490bdb06) Thanks [@mdluo](https://github.com/mdluo)! - Fix: bootstrap an organization on first signup in single-org tenants.
+
+  Fresh `VOBASE_MULTI_ORG=false` tenants previously had no path to enroll the first user — `autoEnroll` early-returned when no `auth.organization` existed, so the first Google signup got an `auth.user` row but no membership and `requireOrganization` 403'd with `"user is not a member of any organization"`.
+
+  `packages/template/auth/index.ts` now bootstraps a sole org during the `user.create.after` hook when none exists. The first signup becomes `owner`; subsequent signups continue to land as `member` of that sole org. The org name and slug are read from `VITE_PLATFORM_TENANT_NAME` and `VITE_PLATFORM_TENANT_SLUG` (platform-stamped at deploy time), defaulting to `"Workspace"` / `"workspace"` if unset.
+
+  Concurrency: the slug is deterministic so the unique index on `auth.organization.slug` serializes parallel first-signups — losers catch the `23505` and re-read the winner's org. The sole-org `LIMIT 1` lookups are now `ORDER BY created_at` for stability if duplicates ever exist (e.g. legacy data, multi→single-org flip).
+
+- [`0949685`](https://github.com/vobase/vobase/commit/0949685201971ae5973d2f8151ba5e6a0d8763cc) Thanks [@mdluo](https://github.com/mdluo)! - Fix: tenant bootstrap now writes the configured slug to the first organization.
+
+  `packages/template/auth/index.ts` computed `orgSlug` from `VITE_PLATFORM_TENANT_SLUG` (or default `"workspace"`) but the subsequent `authOrganization.insert` hardcoded `slug: 'workspace'` — so single-org tenants stamped a different slug at deploy time silently fell back to the default. The retry path on the `23505` (concurrent first-signup) collision still queried `slug = orgSlug`, which then failed to find the just-inserted row when the winner had inserted under `'workspace'`.
+
+  The fix passes `orgSlug` through to the insert, matching the existing retry-side lookup. The unused-variable lint (caught by `biome check`) was the trail to this; the underlying bug had been latent since the bootstrap path landed.
+
+- [`8f376ea`](https://github.com/vobase/vobase/commit/8f376eac4a1512b68123b3828d74f83dfa2b3fd9) Thanks [@mdluo](https://github.com/mdluo)! - `vobase contacts propose-change`: route high-sensitivity fields to `pending` and stop leaking cross-account uniqueness.
+
+  **Confidence default depends on principal.** Agent-origin calls without an explicit `--confidence` now default to `0.85` (was `1.0`). With `T_AUTO_BASE=0.7` + `LEVEL_HIGH=0.7` + `HEADROOM=0.3`, the high auto-bar is `0.91`, so `0.85` routes high-sensitivity fields (`email`, `phone`, `displayName`) to `pending` for staff review while leaving low/medium fields auto-applying. Manual CLI calls (`apikey`/`user` principal) keep the `1.0` default — explicit operator decisions still auto-apply unless the resource is `critical`. Agents can bypass review by passing `--confidence 0.95` when a learned skill or staff memory authorizes direct writes.
+
+  **Unique-violation (`23505`) is now neutral.** The verb's response no longer echoes `pg.detail` (which contained the conflicting row's value, leaking that another customer in the org owns it). The error reads `"That value cannot be set on this contact. Ask the customer to verify or provide a different one."`, and the verb prompt explicitly tells the agent to treat the conflict as confidential.
+
+  Verb prompt updated: `pending` example phrasing now lists `phone` alongside `displayName`/`email` and forbids `"done/updated/all set"` replies; `auto_applied` example shifted to `segments`.
+
+- [`8f376ea`](https://github.com/vobase/vobase/commit/8f376eac4a1512b68123b3828d74f83dfa2b3fd9) Thanks [@mdluo](https://github.com/mdluo)! - Fix: silent in-process DB writes after a bash tool dispatch.
+
+  `just-bash`'s `DefenseInDepthBox.lockWellKnownSymbols()` redefines `Error.stackTraceLimit` as `writable: false` while a bash tool runs. The lock is global (not ALS-scoped), so any postgres transaction begun inside a bash-tool-dispatched verb hits `cachedError` (`postgres@3.4.9` `query.js:169`), which writes `Error.stackTraceLimit = 4` and throws `TypeError: Attempted to assign to readonly property`.
+
+  Symptom: `vobase contacts propose-change` (and any other in-process DB write under bash) failed silently for fresh contacts, while pre-cached SQL templates kept working — making the bug look like model variance.
+
+  Fix: `packages/template/main.ts` now pins `Error.stackTraceLimit` as `configurable: false` at process start, so just-bash's `Object.defineProperty` no-ops (caught by its own try/catch).
+
+  Also surfaces postgres `23505` unique violations as a typed `errorCode: 'unique_conflict'` in `vobase contacts propose-change`, and fixes the rename leftover in `tests/smoke/smoke-all-triggers-live.ts` that pointed at the never-renamed `smoke-staff-note-action-live.ts`.
+
+- [`8f376ea`](https://github.com/vobase/vobase/commit/8f376eac4a1512b68123b3828d74f83dfa2b3fd9) Thanks [@mdluo](https://github.com/mdluo)! - Test infrastructure: consolidate the smoke runtime.
+
+  `tests/helpers/smoke-runtime.ts` is now the single source of truth for live-smoke plumbing — `runSmoke` wrapper, single DB connection, `pollAssistantTurns` with 1s→3s exponential backoff, `pickText`/`pickToolCalls`, `SMOKE_AGENT_ID`, and `dumpConversationState`. The five standalone smokes (`smoke-{inbound,conversation,staff-note,operator-thread,heartbeat}-live.ts`) shrink from 796 LoC to 451 LoC (~43%).
+
+  The big win is failure inspectability: a failing smoke now prints customer messages, agent text, tool calls **with arguments**, tool-result stderr, the wake's journal sequence, change proposals, and `change.*` lifecycle events — not opaque `expected 1 got 0` counts.
+
+  Also drops the orphaned `_smoke-coach-stale.ts`, renames `smoke-wa-{echo,inbound}-live.test.ts` → `*-live.ts` so they no longer get auto-picked-up by `bun test`, fixes `pickToolCalls` to match the canonical `'toolCall'` literal (was checking the non-existent `'tool_call'`), and centralises the seed agent id.
+
+- [`8f376ea`](https://github.com/vobase/vobase/commit/8f376eac4a1512b68123b3828d74f83dfa2b3fd9) Thanks [@mdluo](https://github.com/mdluo)! - Rename the `supervisor` wake trigger to `staff_note`, and drop two pieces of incidental complexity.
+
+  1. **Conceptual merge.** `SupervisorKind` (`'coaching' | 'ask_staff_answer'`) is gone — the @-mention of an agent is the only signal that fires a wake; non-mention staff notes flow through the learning-loop triage instead. This removes the classifier, the tool-stripping logic, and the conditional render text that picked between two coaching styles.
+  2. **Tool `audience` field dropped.** With `SupervisorKind` gone, no caller needs lane-time tool filtering by `audience: 'customer' | 'internal'`; tool `lane` is sufficient.
+  3. **AGENTS.md preamble trimmed.** Lane-aware contributors gate by `triggerKind` and stay focused — drops ~50% of the per-wake preamble bytes.
+
+  Mechanical rename: `WakeTrigger` discriminant `'supervisor'` → `'staff_note'`, `SupervisorWakePayloadSchema` → `StaffNoteWakePayloadSchema`, `MESSAGING_SUPERVISOR_TO_WAKE_JOB` → `MESSAGING_STAFF_NOTE_TO_WAKE_JOB`, file `wake/supervisor.ts` → `wake/staff-note.ts`, smoke file `tests/smoke/smoke-supervisor-action-live.ts` → `tests/smoke/smoke-staff-note-live.ts`. Renderer cue strengthened to clear assignee vs peer-consultation guidance.
+
+  Also adds a path-leak prohibition to `messaging/tools/reply.ts`: customer replies must never cite virtual-FS paths (`/drive/...`, `/contacts/...`, `MEMORY.md`, etc.) or internal ids. Seeds dev WhatsApp placeholder credentials in `modules/contacts/seed.ts` so the adapter Zod validation passes for staff-reply paths in dev.
+
+- [`e3b9a8b`](https://github.com/vobase/vobase/commit/e3b9a8b326f936421bfde74cd7f66e1ddaca4eb5) Thanks [@mdluo](https://github.com/mdluo)! - Add two CI lint rules at CLI verb boundaries.
+
+  `check:trust-defaults` (`scripts/check-trust-defaults.ts`) — scans every file under `modules/` for trust-bearing input fields (`confidence`, `severity`, `priority`, `sensitivity`, `autoApply` / `auto_apply`) declared with literal `.default(...)` values in their Zod schema. Trust levels must be derived in the verb body from `ctx.principal` (see the `effectiveConfidence` pattern in `modules/contacts/cli.ts`), not baked into the schema. Closes the bug class behind the phone-hallucination from 2026-05 — a verb's `confidence: z.number().default(1.0)` quietly set `1.0` for every agent-origin call, exceeding the auto-bar for high-sensitivity fields and auto-writing fabricated values.
+
+  `check:error-shape` (`scripts/check-error-shape.ts`) — scans `cli.ts` and `verbs/**/*.ts` for `error:` properties whose values include `cause.detail`, `cause.message`, `pg.detail`, or `pg.message`, and `data:` properties that pass the bare `cause` / `pg` identifier (or spread it). Closes the bug class behind the cross-account leak from 2026-05 where a verb forwarded raw 23505 `cause.detail` (which contains the conflicting row's primary-key tuple, including `organization_id`) into the agent-visible `error:` string — disclosing existence of another tenant's contact.
+
+  Both rules wire into the existing `check:*` aggregator (`bun run check`); CI picks them up via the `conc bun:check:*` glob.
+
+- Updated dependencies [[`5ee1afd`](https://github.com/vobase/vobase/commit/5ee1afd390b3b0fffbdc9d46fc3d95e5763ee14e), [`8f376ea`](https://github.com/vobase/vobase/commit/8f376eac4a1512b68123b3828d74f83dfa2b3fd9)]:
+  - @vobase/core@0.37.0
+
+## 3.7.0
+
+### Minor Changes
+
+- [`ca13867`](https://github.com/vobase/vobase/commit/ca138676411ef53d43b6dbc8972e2cdc4772d739) Thanks [@mdluo](https://github.com/mdluo)! - template: PROFILE.md is now read-only at the workspace level. Customer-asked profile updates flow through the new `vobase contacts propose-change` CLI verb (default `--kind field_set`; `--kind markdown_patch` for prose). Non-gated fields auto-apply; gated fields (`displayName`, `email`) queue for staff review. Activity events (`change.proposed` / `change.auto_applied` / `change.approved` / `change.rejected`) render inline in the staff-inbox timeline with the proposing/deciding principal and a discrete InfoIcon HoverCard for rationale + decision notes.
+
+  template: GFM tables in AGENTS.md (and other markdown surfaces using the same Plate editor) now render in the content editor — added `@platejs/table` and registered table/row/cell/header element components. Previously the Memory-scopes table appeared as blank space.
+
+  template/changes: duplicate-pending proposals on the same contact now surface as a typed `pending_conflict` errorCode (with `existingProposalId`) instead of a generic 409. The `vobase contacts propose-change` verb prompt instructs the agent to acknowledge the prior pending request rather than fabricate an approval.
+
+  core/workspace: removed unused `contactProfile` / `staffProfile` dirty-diff buckets from `ScopedDiff`. The template no longer tracks PROFILE.md frontmatter as dirty (it's RO and rendered from the row).
+
+### Patch Changes
+
+- Updated dependencies [[`ca13867`](https://github.com/vobase/vobase/commit/ca138676411ef53d43b6dbc8972e2cdc4772d739)]:
+  - @vobase/core@0.36.1
+
+## 3.6.3
+
+### Patch Changes
+
+- [`a001687`](https://github.com/vobase/vobase/commit/a001687fab50f16f5c5575908373b5b27a168c55) Thanks [@mdluo](https://github.com/mdluo)! - # Internal-note attribution + @-mention-only supervisor fan-out
+
+  Two related fixes around staff-authored internal notes.
+
+  ## Timeline now shows real names instead of "Customer" / "Staff"
+
+  Two attribution bugs in the conversation timeline:
+
+  - **Internal notes always rendered as "Staff."** `useSendNote` was hard-coding `authorId: 'staff'` (literal string) when posting, so `internal_notes.author_id` could never be resolved by the principal directory and every freshly-sent note fell through to the generic "Staff" label. The hook now requires the real `currentUserId` (passed in from `useCurrentUserId()` in `Composer`) so notes carry the canonical `staff:<userId>` token and resolve to the staff member's display name + avatar.
+  - **Customer messages always rendered as "Customer."** `messagePrincipal` returned `null` for `role === 'customer'` because rows don't carry a sender id, leaving the bubble's fallback ("Customer") in place. `MessageThread` now accepts the conversation's `contactId`; customer rows resolve via `directory.resolve('contact:<id>')` to the actual contact name. `ConversationDetail` threads `contactId` through. The other `MessageThread` caller (`ConversationContextSnippet` in proposal rows) doesn't have a `contactId` in scope and keeps the previous "Customer" fallback — no behavior change there.
+
+  Staff-message rows still resolve to the alphabetically-first staff member because `messages` rows don't carry a `senderUserId` column; that's a schema change separate from this fix.
+
+  ## Internal notes only wake an agent when the agent is @-mentioned
+
+  Previously, every staff-authored note triggered an unconditional supervisor wake on the conversation's assignee agent — which in turn appended a "memory note" entry as the agent processed the wake. The new rule is simpler and matches staff intent: **a note only wakes an agent when staff explicitly `@-mentions` that agent.**
+
+  Effects:
+
+  | Note in MeriGPT-assigned conv                   | Before                                     | After                                   |
+  | ----------------------------------------------- | ------------------------------------------ | --------------------------------------- |
+  | `"hey team, fyi"` (no mention)                  | 1 wake (assignee)                          | **0 wakes**                             |
+  | `"@Sentinel can you look?"`                     | 2 (assignee + Sentinel)                    | **1 (Sentinel)**                        |
+  | `"@MeriGPT please double-check"` (self-mention) | 1 (assignee, `mentionedAgentId=undefined`) | **1 (with `mentionedAgentId=MeriGPT`)** |
+  | `"@Sentinel @Atlas"`                            | 3                                          | **2**                                   |
+  | Agent-authored note                             | 0                                          | **0 (unchanged)**                       |
+
+  `runSupervisorFanOut` (`modules/messaging/service/notes.ts`) drops the unconditional assignee self-wake and the self-mention skip; it now iterates only over agents resolved by `resolveAgentMentionsInBody` and short-circuits when there are none.
+
+  `isPeerWake` in `wake/conversation.ts` is redefined from "the booted agent IS the mentioned one" to "the booted agent is NOT the conversation assignee." This preserves the original "ownership" distinction across the fan-out change: an `@`-mentioned assignee still goes through the `coaching` / `ask_staff_answer` classifier (and the coaching-strip filter on customer-facing tools), while an `@`-mentioned non-assignee continues to behave as a peer consultation with reply tools available but a render that explicitly tells them not to send a customer-facing reply.
+
+  `tests/e2e/supervisor-mention-fanout.test.ts` updated to reflect the new shape — cases (a)–(d) lose the implicit assignee wake and case (b) self-mention now carries `mentionedAgentId=MeriGPT`. New case `(f)` covers the "plain note → 0 enqueues" path so the @-mention-only rule has explicit coverage.
+
+  **Changed:**
+
+  - `modules/messaging/hooks/use-send-note.ts` — `useSendNote(conversationId, authorId)` now requires the real user id; throws on a null `authorId`.
+  - `modules/messaging/components/composer.tsx` — passes `useCurrentUserId()` into the hook.
+  - `modules/messaging/components/message-thread.tsx` — `MessageThread` accepts `contactId`; `messagePrincipal` resolves customer rows via `contact:<id>`.
+  - `modules/messaging/components/conversation-detail.tsx` — threads `contactId` through.
+  - `modules/messaging/service/notes.ts` — supervisor fan-out only enqueues for `@-mentioned` agents.
+  - `wake/conversation.ts` — `isPeerWake` reframed against the conversation assignee.
+  - `wake/supervisor.ts`, `runtime/bootstrap.ts` — doc comments updated.
+  - `tests/e2e/supervisor-mention-fanout.test.ts` — assertions updated for the new fan-out, plus a new plain-note coverage case.
+
+  No schema changes.
+
+## 3.6.2
+
+### Patch Changes
+
+- [`759bf6c`](https://github.com/vobase/vobase/commit/759bf6c091efa74c7d1c108b30c81ac26cb9b9ea) Thanks [@mdluo](https://github.com/mdluo)! - # Resizable Drive + collapsible AGENTS.md preamble
+
+  Three UI tweaks on the agent detail page (`/agents/<id>`) and any page that embeds `<DriveSection>`:
+
+  - **Drive split is now user-resizable.** Both the horizontal Drive layout (contact + staff detail pages) and the vertical Drive layout (agent detail page) now wrap the file list and preview in `react-resizable-panels` `Group`/`Panel` with a draggable `GradientResizeHandle` between them. Sizes persist per-orientation in `localStorage` (`vobase:drive-horizontal`, `vobase:drive-vertical`).
+  - **File list defaults to a smaller portion in vertical layouts.** The vertical split was a fixed 1:2 grid (33% file list / 67% preview). New default is 28% / 72%, and the user can drag to anywhere between 15%–60% for the list. Horizontal layouts default 40% / 60% (was a fixed 1:1).
+  - **AGENTS.md auto-generated preamble is collapsed by default.** On the agent detail page, the read-only preamble at the top of `/AGENTS.md` previously occupied the full preview height and forced staff to scroll past it before they could see the editable instructions. The preamble now opens collapsed (`max-h-32` with a bottom-fade) with a `Show more / Show less` toggle, and its background is `bg-muted` (was `bg-muted/40`) so it visually separates from the surrounding `bg-background` `InfoCard` instead of blending in.
+
+  **Changed:**
+
+  - `modules/drive/components/drive-browser.tsx` — replaces the orientation-conditional CSS grid with `react-resizable-panels`. The empty-preview path (no file selected) keeps a plain full-bleed file list. Mobile fallback is unchanged (single pane with a back-bar).
+  - `modules/agents/components/agents-md-editor.tsx` — `PreambleView` gains a `useState` collapse toggle and a fade-mask overlay; bg bumped to `bg-muted`.
+  - `src/components/ui/gradient-resize-handle.tsx` — `GradientResizeHandle` gains a `direction: 'col' | 'row'` prop. Default `'col'` keeps existing call sites byte-identical; `'row'` switches to `h-px w-full cursor-row-resize` for use inside a vertical `Group`.
+
+  No backend, schema, or harness changes.
+
+## 3.6.1
+
+### Patch Changes
+
+- [#75](https://github.com/vobase/vobase/pull/75) [`61b46b9`](https://github.com/vobase/vobase/commit/61b46b9b3daa18b0c4ef509881db8a4947eef0fc) Thanks [@amirahillyana](https://github.com/amirahillyana)! - fix(template): resolve dist/web from project root in production server
+
+  `runtime/bootstrap.ts` computed the SPA dist directory as `join(import.meta.dir, 'dist', 'web')`, which resolves to `/app/runtime/dist/web` at runtime. The Vite build outputs to `/app/dist/web`, so the `index.html` lookup always failed and the static-files block silently no-op'd — every freshly-deployed tenant returned Railway's edge 404 on `/`. Walk one directory up so the path matches the Dockerfile layout.
+
+## 3.6.0
+
+### Minor Changes
+
+- [`354da30`](https://github.com/vobase/vobase/commit/354da30c3dfd9edb84d9ab3a8e04efb213c24d0e) Thanks [@mdluo](https://github.com/mdluo)! - # profile.md becomes the canonical editable view for contacts and staff
+
+  YAML frontmatter at the top of `/contacts/<id>/profile.md` and `/staff/<id>/profile.md` is now the agent's structured-edit surface. The workspace-sync observer parses dirty profile.md, computes a diff against the canonical row, and submits a `field_set` change-proposal. Approval routes through the existing change-proposal pipeline:
+
+  - **Contacts** auto-apply by default; `displayName` and `email` queue for staff approval via the new `requiresApprovalForFields` registry option.
+  - **Staff** join the change-proposal pipeline for the first time (`requiresApproval: true`); all staff edits queue.
+  - **Markdown patches** to `profile` are no longer accepted on contacts — `MARKDOWN_FIELDS` is `{'memory'}` only. profile.md body below the frontmatter is auto-rendered.
+
+  **New surface:**
+
+  - `wake/profile-frontmatter.ts` exports `renderContactFrontmatter`, `renderStaffFrontmatter`, `parseFrontmatter`, and `diffProfile`. Render output is byte-stable (sorted keys, double-quoted strings, omits null / empty fields). Parser uses Bun's YAML 1.2 default so date strings stay strings.
+  - `modules/team/service/changes.ts` (new) ships `staffChangeMaterializer` for the `(team, staff)` resource pair. Allowed scalars: `{displayName, title, availability, capacity, expertise, sectors, languages}` plus `attributes.*`. `email` lives in `auth.user` and is intentionally out-of-scope for v1 (rejected with a `validation` error if proposed).
+  - `runtime/tz.ts` exports `ORG_TIMEZONE = process.env.TZ ?? 'Asia/Singapore'` as the seam for org-wide `date`-attribute interpretation.
+
+  **Changed:**
+
+  - `modules/changes/service/proposals.ts`: `registerChangeMaterializer` gains `requiresApprovalForFields?: ReadonlySet<string>`. When a `field_set` proposal touches a gated top-level scalar key, the proposal is forced to `pending` regardless of the resource-level default. `attributes.*` keys are not gated.
+  - `modules/contacts/agent.ts` and `modules/team/agent.ts`: profile.md materializers emit frontmatter via the new renderer; the read-only hint for profile.md paths is removed; AGENTS.md contributors are reframed to describe the editable frontmatter surface.
+  - `modules/agents/agent.ts`: the `agents.memory-conventions` contributor gains a `## Structured fields vs prose memory` section covering the three capture-trigger categories (customer-volunteered facts, staff-volunteered facts in internal notes, high-confidence inferences) plus the explicit `frontmatter vs MEMORY.md` split rule.
+  - `wake/observers/workspace-sync.ts`: on `agent_end`, profile.md edits route through `insertProposal` with a `field_set` payload built from `diffProfile(baseline, current)`. Unknown keys are dropped before `insertProposal` and warned. Empty diffs (reordered keys, no value change) produce zero proposals.
+  - `wake/workspace/index.ts`: profile.md paths move from `readOnlyExact` to `memoryPaths` so they're writable and tracked by the dirty diff.
+
+  **Manual smoke (not CI-gated).** Reproduce the GK Corp scenario against the dev server:
+
+  ```bash
+  # 1. Send a customer message that volunteers structured facts.
+  curl -X POST http://localhost:3001/api/channels/web/inbound \
+    -H 'Content-Type: application/json' \
+    -d '{"contactId":"<id>","body":"I work at Northwind Logistics, 120 employees, renewal in September","externalKey":"web:demo"}'
+
+  # 2. Wait for agent_end; inspect the change_proposals row.
+  psql $DATABASE_URL -c "select id, status, payload from changes.change_proposals where resource_id='<id>' order by created_at desc limit 1;"
+
+  # 3. Confirm contacts.attributes was updated post-apply.
+  psql $DATABASE_URL -c "select attributes from contacts.contacts where id='<id>';"
+  ```
+
+  Expected: one `change_proposals` row with `kind: 'field_set'` containing the three new attribute keys, status `auto_written` (no gated keys touched), and `contacts.attributes` reflecting the merged values.
+
+  ## Lifecycle observability + agent acknowledgement
+
+  Built on top of the field_set work above so staff and the customer both get continuous feedback as a profile-edit moves through propose → decide → apply.
+
+  **New surface:**
+
+  - `wake/observers/sensitive-write-warner.ts` — `OnToolResultListener` that diffs `/contacts/<id>/profile.md` and `/staff/<id>/profile.md` after every `bash` tool call, lazily baselined per wake. When a gated frontmatter field (`displayName`, `email`) is touched it appends a `vobase notice:` block to the bash result's `stderr` — the _same_ tool result the model is about to read — so the next assistant message can phrase the customer reply as a request that's been queued for staff review rather than confirming a change that's still pending. Cheap short-circuit on `args.command` keeps the disk reads off the hot path when the bash call doesn't reference a profile path. Gated key sets live in `wake/observers/gated-fields.ts` so workspace-sync and the warner share one source of truth.
+  - `wake/change-decided.ts` — `CHANGES_DECIDED_TO_WAKE_JOB` (`changes:decided-to-wake`) bridge: the decide endpoint enqueues a wake on conversation-bound proposals only (filters synthetic `operator-`/`heartbeat-` ids), `pg-boss` singletonKey on `(conversation, proposal, decision)` dedups rapid clicks. The handler boots a conversation-lane wake with the new `change_decided` trigger.
+  - `wake/events.ts` adds the `change_decided` `WakeTrigger` variant with `{proposalId, decision, resourceModule, resourceType, resourceId, summary, decidedNote, decidedBy}`. `wake/trigger.ts` registers the renderer (`renderChangeDecided`): on approval it requires a fresh customer reply even if the agent previously said "logged for review"; on rejection it surfaces the staff note to the agent (verbatim, marked "for your understanding only — do NOT quote") and asks for a polite acknowledgement. Both branches forbid re-attempting the write.
+  - `modules/changes/service/lifecycle-summary.ts` — backend-safe `summarizeLifecycleEvent` produces a short, contextual one-liner suitable for inline timeline rendering ("Email change to marc@x.com", "Display name and email change", "3 contact fields updated", "Memory note appended"). 12 unit tests pin behaviour.
+  - `tests/helpers/changes-smoke.ts` — atomic helpers (`open`, `sendInbound`, `waitForReply`, `insertPending`, `decide`, `listJournal`, `listActivity`, `listTranscript`, `close`) for stepping through the propose/decide/wake pipeline interactively against a live dev server. Reuses `devLogin` + `makeAuthedFetch` from `tests/smoke/_helpers.ts`.
+
+  **Changed:**
+
+  - `modules/changes/service/proposals.ts`: emits 4 lifecycle events into `harness.conversation_events` for any conversation-bound proposal — `change.proposed`, `change.auto_applied`, `change.approved`, `change.rejected`. The journal write is best-effort (try/catch + warn so a missing journal service in unit tests doesn't roll back the proposal tx). Emit sites consolidated via a `LifecycleVariant` discriminated union; the helper derives `proposalId`, `kind`, `resource*`, and `summary` from the proposal row so call sites only specify what varies. The decide endpoint additionally enqueues `CHANGES_DECIDED_TO_WAKE_JOB` for conversation-bound proposals.
+  - `modules/changes/module.ts`: installs a `decidedScheduler` that bridges service-level decide calls to the new pg-boss job.
+  - `modules/messaging/service/conversations.ts`: `TIMELINE_ACTIVITY_TYPES` extended with the 4 new `change.*` types so they flow through the existing `/api/messaging/conversations/:id/activity` endpoint.
+  - `modules/messaging/components/message-thread.tsx`: new `<ChangeActivityLine>` renders the journal `summary` as the primary line (rationale + decidedNote move to a `HoverCard` so the timeline stays scannable). The whole row links to `/changes?id=<proposalId>` so staff can jump to the proposal record. Suppresses system-emitted rejection tokens (`staff_rejected`, `threat_scan`).
+  - `modules/changes/pages/index.tsx` + `src/components/changes/change-history-list.tsx` + `src/components/changes/proposal-row.tsx`: route search schema accepts `id`; the page auto-switches to History when the linked proposal isn't pending, scrolls the matching row into view, and adds a 2.4s ring highlight (latched via `useRef` per `(highlightId, tab)` so realtime refetches don't re-fire). `ProposalRow`'s root went from `<li>` to `<div>` and the call sites wrap with `<li data-proposal-id>` so the structure stays valid.
+  - `wake/observers/workspace-sync.ts`: `WorkspaceSyncOpts` gains `conversationId` and the proposal write threads it through to `insertProposal` (was hardcoded `null`, which silently dropped lifecycle events for agent-driven edits).
+  - `wake/build-base.ts` + `wake/conversation.ts` + `wake/standalone.ts`: `composeHooks` accepts an optional `coreToolResults: OnToolResultListener[]` array; both lane builders thread the new sensitive-write-warner through it.
+  - `wake/prompt.ts`: static instructions gain a `## Bash sandbox` section listing the WebContainer toolchain (no `python`/`node`/`jq`/`yq`/`perl`/`ruby`) plus `sed`/`echo`/here-doc patterns for frontmatter edits with explicit insert-or-replace examples (a new contact's frontmatter often only has `displayName`+`marketingOptOut`, so a "replace existing key" sed silently no-ops on absent fields). Plus a `## When the customer asks you to write something` order-of-operations rule (attempt the write → cat to verify → read stderr notice → reply based on what the notice actually said).
+  - `modules/contacts/agent.ts`: AGENTS.md fragment for `contacts.contact-context` gains a 5-step workflow ("when the customer asks for a profile change") that explicitly forbids "logged for review" replies without a verified upstream edit.
+  - `runtime/bootstrap.ts`: registers the new `CHANGES_DECIDED_TO_WAKE_JOB` handler.
+
+  **Manual smoke (lifecycle):**
+
+  ```bash
+  # Same dev-server prereqs as above.
+  bun -e '
+    import { open, sendInbound, waitForReply, insertPending, decide, listActivity, close } from "./packages/template/tests/helpers/changes-smoke"
+    const ctx = await open({ from: `smoke-${Date.now()}` })
+    const conv = await sendInbound(ctx, "Quick question about your team.")
+    await waitForReply(ctx, conv.conversationId, 0)
+    const pid = await insertPending(ctx, { contactId: conv.contactId, conversationId: conv.conversationId, field: "email", value: `marc.${Date.now()}@example.com`, rationale: "Customer asked to update email on file" })
+    await decide(ctx, pid, "approved")
+    await waitForReply(ctx, conv.conversationId, 1)
+    console.log(await listActivity(ctx, conv.conversationId))
+    await close(ctx)
+  '
+  ```
+
+  Expected: `change.approved` activity row carrying `summary: "Email change to …"` + `proposalId`; agent posts a brief customer-facing confirmation reply on the next wake.
+
+  ## propose_contact_update — first-class tool for customer-asked profile edits
+
+  Closes the agent-tool-discipline gap that surfaced during the lifecycle smoke: with bash-edited `profile.md` as the only path, `gpt-5.4` (and Sonnet, tested via single-line model swap) reliably skipped the bash sed for customer-asked profile updates and replied with a hallucinated "logged for review" — silently breaking the propose pipeline (no `change_proposals` row, no journal event, no staff inbox entry, no `sensitive-write-warner` notice). 5 consecutive baseline runs produced 0 proposals; 4 prompt iterations did not move the model.
+
+  **New surface:**
+
+  - `modules/contacts/tools/propose-contact-update.ts` — conversation-lane, customer-facing tool. `audience: 'customer'`, `lane: 'conversation'`. Resolves `contactId` from `ctx.conversationId` (the model can't pick the wrong contact). Input is `{patch, rationale}` where `patch` accepts `{displayName, email, phone, segments, marketingOptOut, attributes}`; `attributes` is a flat map flattened to `attributes.*` field_set keys server-side. Builds the `field_set` diff against the current row, reuses `buildFieldSetCopy` for `expectedOutcome`, and forwards the model's `rationale` verbatim to `insertProposal`. Returns `{proposalId, status, fieldsTouched, replyHint}` where `replyHint` is one of three deterministic strings keyed off `status`:
+    - `auto_written` → "Tell the customer the change is done (it applied immediately and is now on file)."
+    - `pending` → "Tell the customer it's logged for our team to review (a gated field was touched)."
+    - `no_op` → "No values would change — the patch you proposed already matches what's on file."
+      Idempotent on rapid double-call: a duplicate-pending conflict from `insertProposal` collapses to `{status: 'pending', proposalId: null}` rather than re-throwing, so the model still gets a deterministic answer.
+  - 7 unit tests in `modules/contacts/tools/propose-contact-update.test.ts`. Uses `mock.module('@modules/changes/service/proposals', …)` because `wake/observers/workspace-sync.test.ts` and `wake/observers/learning-proposals.test.ts` already mock that module process-wide; an `installChangeProposalsService` stub would silently lose to their `mock.module` replacement.
+
+  **Changed:**
+
+  - `modules/contacts/agent.ts`: registers `proposeContactUpdateTool` in `contactsTools` and rewrites the `contacts.contact-context` AGENTS.md fragment to lead with the tool. The 5-step bash workflow is replaced with a 3-step tool workflow ("call `propose_contact_update`; read the returned `status`; reply accordingly"). Bash-editing `profile.md` is demoted to operator/admin workflows; the fragment explicitly tells the agent that bash-as-customer-shortcut is silently ignored.
+
+  **Verified.** Re-running the same gpt-5.4 baseline smoke after the fix:
+
+  | Runs       | bash calls | proposals created | journal events        | reply matches reality          |
+  | ---------- | ---------: | ----------------: | --------------------- | ------------------------------ |
+  | Before fix |      0 / 5 |             0 / 5 | none                  | "logged for review" — false    |
+  | After fix  |      0 / 4 |         **4 / 4** | `change.proposed` × 4 | "logged for review" — **true** |
+
+  Plus a non-gated phone-update run that auto-wrote (`status=auto_written`, `contacts.phone` updated to the new value) and the agent replied with the corresponding "all set" copy.
+
+### Patch Changes
+
+- [`7776abf`](https://github.com/vobase/vobase/commit/7776abf49c838c6e1d86227917782a6a516075d4) Thanks [@mdluo](https://github.com/mdluo)! - # Tint composer background when in internal-note mode
+
+  The inbox composer uses a single `PromptInput` for both customer reply and internal-note modes, distinguished only by the active tab. Switching to **Note** changed the placeholder and submit label but left the input box visually identical to a customer reply, so it was easy to mistake one for the other at a glance.
+
+  Match the composer surface to the note message bubble (`bg-amber-50/70` light, `bg-amber-950/25` dark, `border-amber-500/30`) when `mode === 'note'`. Reply mode is unchanged. Same color tokens already used by `NoteRow` in `message-thread.tsx`, so the composer reads as a draft of the bubble it will produce.
+
+- [`9bc15cd`](https://github.com/vobase/vobase/commit/9bc15cd3443d8bf126601e5e58b86232cbabbfa9) Thanks [@mdluo](https://github.com/mdluo)! - # Full-height Drive on detail pages, agent page joins side-by-side layout
+
+  Three follow-ups to the contact/team detail-page rework:
+
+  - **Agent detail page now uses the same two-column layout.** Settings + Save on the left, vertical-orientation Drive on the right. Save button is contextual — only renders while the form is dirty.
+  - **Drive panel fills the column on `lg+`.** Detail pages flip `PageBody` to `flex flex-col` and the grid container to `flex-1` so the right column claims all remaining vertical space; `DriveSection` takes `lg:h-full` to override the default `h-[60vh]`. Below `lg` Drive keeps the original 60vh box. Left column gets its own internal scroll if its sections exceed the available height.
+  - **Vertical Drive prefers content over file list.** When `orientation="vertical"` and a file is selected, the grid splits the panel `1fr` for the file list and `2fr` for the preview/editor (was `1fr/1fr`), so AGENTS.md / PROFILE.md / etc. get the room they need without shrinking the file list to nothing.
+
+- [`9555875`](https://github.com/vobase/vobase/commit/95558755e1dbc30460fd2530b989333f43670f69) Thanks [@mdluo](https://github.com/mdluo)! - # Side-by-side detail pages with vertical Drive
+
+  The contact and team detail pages now use a two-column layout on `lg` and up: identity sections on the left, the entity's Drive on the right. The previous stacked layout pushed Drive below the fold whenever the attributes list grew.
+
+  **Two sections per entity, one role each.** Native fields (Email/Phone/Segments/Marketing on contacts; Title/Availability/Capacity/Sectors/Expertise/Languages on staff) sit in a read-only `InfoCard` with an Edit button that opens the existing form dialog. Custom attributes sit in their own `InfoCard` with inline-editable rows, dirty-tracking, and a contextual `Save (N)` button that only appears while a field is dirty.
+
+  **Add new attributes from the detail page.** A `+ Add attribute` row at the end of the attributes card opens the existing `AttributeFormDialog` to create a new definition, which appears on every contact/staff member via query invalidation — no detour to `/contacts/attributes` or `/team/attributes` for one-off fields.
+
+  **Drive can stack vertically.** `DriveBrowser` takes a new `orientation: 'horizontal' | 'vertical'` prop; `vertical` switches the desktop grid from columns to rows so the file list sits on top and the preview stacks below. Detail pages pass `vertical` so Drive fits in a single right-column box; the standalone `/drive` page keeps the original horizontal split.
+
+  Other cleanup: removed the staff `Profile` field from the dialog (already covered by `/PROFILE.md` inside Drive), dropped the unused module-level `attribute-table` wrappers and the shared `src/components/attributes/attribute-table.tsx`, and removed the "Settings" section heading on the agent detail page so its `InfoCard` matches the other detail pages' style.
+
+- [`466ff11`](https://github.com/vobase/vobase/commit/466ff1187e960443a753c717e46d543284a9ca92) Thanks [@mdluo](https://github.com/mdluo)! - # Memory hygiene: budget headers, capture triggers, scope conventions
+
+  Revamp how the agent harness instructs and budgets `MEMORY.md` across all three scopes (agent self / contact / staff).
+
+  **AGENTS.md additions** — three new sections compose into every wake's AGENTS.md:
+
+  - `agents.self-state` (priority 20, trimmed) — file locations only, no longer carries capture imperatives.
+  - `agents.memory-capture-triggers` (priority 25) — "## When to capture" with the auto-loop reframe (do NOT echo `internal_note_added` / supervisor coaching; the self-learn loop captures those automatically). Lists keywords (`always`, `never`, `from now on`, `remember that`, `next time`) for mid-wake self-lessons only.
+  - `agents.memory-conventions` (priority 26) — three-row scope table (agent / contact / staff) with paths, when-to-write, append + sed mutation patterns, and a 30-day prune rule.
+
+  **Per-wake budget header** — every materialized `MEMORY.md` gains a deterministic `<!-- memory-budget scope=... id=... chars=N (utf16) cap=8000 over=true|false -->` line as a soft visibility hint. Header is render-time only and `stripBudgetHeader` keeps storage clean (no header round-trip into the DB column on workspace-sync flush). Header surface is capped to the first 5 staff ids per wake (`STAFF_BUDGET_HEADER_CAP`); body materialization still iterates all `staffIds` so the workspace surface is unchanged.
+
+  **Self-learn loop fix** — `Note: —` empty-body bug in the `## Staff signal —` block that the `learning-proposals` observer appends. The supervisor wake's `agent_start` payload only carries `noteId`; the observer now looks up the body via `listNotes(conversationId)`, capped at 800 chars, so the captured rule actually surfaces in working memory.
+
+  **Determinism** — `wake/memory-budget.ts` is byte-pure (source-regex guard bans `Date`, `Math.random`, `process.env`, `os.hostname`, `__dirname`, etc.). Cross-wake `systemHash` stability test added to `wake/prompt.test.ts` covering all three scope headers reaching the rendered system prompt.
+
+  **Tests** — 79 passing across `wake/memory-budget.test.ts`, `wake/observers/workspace-sync.test.ts`, `wake/observers/learning-proposals.test.ts`, `modules/{agents,contacts,team}/agent.test.ts`, `wake/prompt.test.ts`, `wake/build-base.test.ts`. Live smoke verified the GK Corp regression bug (customer-volunteered facts now persist to `/contacts/<id>/MEMORY.md`).
+
+## 3.5.0
+
+### Minor Changes
+
+- [`927b0ea`](https://github.com/vobase/vobase/commit/927b0eaf87d705554f78b1956e77e204f10972fe) Thanks [@mdluo](https://github.com/mdluo)! - # Fix: managed-mode WhatsApp end-to-end wire delivery
+
+  Customer messages reaching the agent via the platform-managed WhatsApp sandbox produced agent replies that landed in the inbox UI but never reached the customer's WhatsApp. Diagnosis surfaced two independent bugs at the egress boundary plus three smaller papercuts around sandbox claim ergonomics.
+
+  ## What changed
+
+  ### Identity vs. external keys (`@modules/contacts`)
+
+  Inbound contact resolution stamped a canonical `${channel}:` prefix onto `contacts.phone` (so `whatsapp:6512345678` instead of `+6512345678`) to keep external keys non-colliding across channels. Outbound dispatch then handed that prefixed value verbatim to `adapter.send({ to })`, and Meta's Graph API silently rejected the malformed recipient — agent reply persisted, wire never fired.
+
+  The fix splits identity from per-channel dedup keys.
+
+  - **New table** `contacts.contact_external_keys (org_id, channel, external_key, contact_id)` with PK on the triple, index on `contact_id`. Inbound dispatch resolves the contact via this table.
+  - **`contacts.phone` and `contacts.email` are now bare canonical identity** (E.164 with leading `+`, lowercased RFC email) — no channel prefix. Outbound reads them directly with no stripping.
+  - **New normalizers** `normalizePhoneE164` (strip non-digits, prepend `+`, length-bound 7–15) and `normalizeEmail` (trim + lowercase) in `modules/contacts/service/identity-normalize.ts`. Light-touch, no `libphonenumber-js` dep — forks that need region-aware validation can compose their own.
+  - **`upsertByExternal` → `upsertByExternalKey`** with shape `{ organizationId, channel, externalKey, phone?, email?, displayName? }`. Lookup chain: existing key row (single `INNER JOIN`) → existing contact by `phone` or `email` for cross-channel merge → fresh contact + key row. Idempotent key insert with re-fetch handles concurrent inbound races.
+  - **Inbound dispatch** reads `adapter.contactIdentifierField` to decide whether `event.from` is a phone (normalize → store as `phone` AND key), email, or opaque session token (key only, no phone/email). Adapter resolution now throws on unknown channel instead of silently treating raw `event.from` as the dedup key.
+
+  `packages/template/modules/contacts/seed.ts` is unchanged — the seed contacts already used bare `+E.164` phones; the prefix scheme was an inbound-only convention.
+
+  ### Tenant signing for managed-mode outbound (deferred to platform fix)
+
+  The tenant-side outbound signing was correct end-to-end. The platform's `verifyTenantSignature` middleware was using tenant-level HMAC for verification while the platform's own forwarded webhooks used per-channel claim secrets — causing every outbound graph proxy call to 401 with `Invalid signature (v2)`. That asymmetry is fixed in `vobase-platform` (separate commit); no further tenant change required.
+
+  ### Sandbox-claim ergonomics
+
+  - `claim-sandbox-dialog.tsx` no longer gates the "Claim sandbox" button on `availability > 0`. The platform's `allocateManagedChannel` is idempotent on `(tenantSlug, environment, channelInstanceId)` and self-heals orphan claims; gating the click would make those self-heal paths unreachable for any tenant whose `/health` reports zero free slots due to a stale claim row.
+  - `handshake.ts::fetchSandboxAvailability` now throws `PlatformHandshakeError('platform_unauthenticated')` when the platform's `/health` strips data fields due to HMAC verification failure, instead of returning `{ sandboxPoolAvailable: 0 }` and masquerading as pool exhaustion. The dialog now shows the actual auth-failure reason.
+  - `channel-row-menu.tsx` web variant now wraps the dropdown trigger in a `flex items-center justify-end` container to match the WhatsApp variant — fixes misaligned menu buttons in the channels table.
+
+  ### Tests
+
+  - New `identity-normalize.test.ts` covers length bounds + null/empty rejection.
+  - `echoes.test.ts` and `webhook-routing.test.ts` register a stub WhatsApp adapter via the registry now that inbound dispatch hard-errors on missing adapter.
+  - `wake/workspace/create.test.ts` and `web/tests/inbound.test.ts` updated for the renamed method.
+
+  ## Migration
+
+  Schema changes mean `bun run db:reset` is required after pulling this. There's no in-place migration — projects forked from the template before this should: pull the new `contacts/schema.ts` + `contacts/service/`, run `db:reset`, and re-pull `channels/service/inbound.ts` + `channels/adapters/web/handlers/inbound.ts` to use the new service shape.
+
+  ## Deferred
+
+  - E.164 region-aware normalization (Brazil 12↔13-digit, etc.) — channel adapters with region quirks should compose their own normalizer over `normalizePhoneE164`.
+  - Cross-channel merge race window — relies on the existing `(orgId, phone)` unique index surfacing as a hard error if two concurrent inbounds race to create the same contact. Closing the window cleanly would need a wrapping transaction with `SELECT ... FOR UPDATE`; out of scope for a scaffold.
+  - Contact form normalizer divergence — `contact-form-dialog.tsx` still trims raw input; aligning with `normalizePhoneE164` would close a future-state where a form-entered phone could mismatch an inbound-resolved phone for the same person.
+
+### Patch Changes
+
+- [#71](https://github.com/vobase/vobase/pull/71) [`27490cf`](https://github.com/vobase/vobase/commit/27490cfa091248033ef194e57efb3aa4a4734eca) Thanks [@TheSoggy](https://github.com/TheSoggy)! - # Drop epoch-stamped skip cache from test-db helper
+
+  `tests/helpers/test-db.ts` cached `bun run db:reset` results via a 5-second `RUN_EPOCH` sentinel — files whose `beforeAll` landed within the same epoch as a successful reset would skip resetting. Sound for deduplicating parallel-worker setup, but unsound for tests that mutate seed rows: any DELETE/UPDATE in one file polluted the seeded DB for every later file inside the same epoch window. Manifested as order-dependent FK violations (`messaging.conversations.contact_id → contacts.contacts(id)`) and an anonymous `(unnamed)` mid-suite `db:push failed` whose 5-second duration matched the epoch bucket.
+
+  Drop the cache. Every test file's `beforeAll` now reseeds unconditionally under the existing flock. No DB-lifecycle issues — `bun run db:reset` works fine even when other test processes hold open `postgres` connections (verified empirically with sequential subprocess invocations).
+
+  **Suite impact**: 0 failures (was 4); 67-71s runtime (was ~8s, but with 4 polluted-state failures). Stable across 3 consecutive runs. If suite latency becomes a concern, the next iteration is in-process `TRUNCATE ... CASCADE` + reseed using the existing module `seed(db)` exports — same correctness, sub-second per file.
+
+  Resolves [#69](https://github.com/vobase/vobase/issues/69).
+
+- [`8cdbb57`](https://github.com/vobase/vobase/commit/8cdbb57daf4dac65391cae6dfea7656f681175c6) Thanks [@mdluo](https://github.com/mdluo)! - # WhatsApp card rendering, agent handoff UX, and supervisor coaching fixes
+
+  Six related fixes uncovered while debugging local-chat conversations on the
+  managed-WhatsApp sandbox.
+
+  **WhatsApp `send_card` now renders all child elements.** Outbound dispatch
+  previously squashed cards to `title + subtitle`, dropping every `fields`,
+  `text`, `link`, `image`, `divider`, and `link-button` child. The new
+  `cardToOutbound` helper walks card children in order and emits a real
+  `metadata.interactive` payload — `type=button` for ≤3 reply buttons,
+  `type=list` for 4–10. Non-WhatsApp channels fall back to plain text. Footer
+  is intentionally not auto-promoted from a trailing text child (the schema has
+  no footer signal and any heuristic misclassifies normal prose).
+
+  **Web inbox card buttons are read-only for staff.** The web `MessageCard`
+  now threads a `readOnly` prop down to `CardActions`; the staff inbox passes
+  it (`message-thread.tsx`), so buttons render disabled and never POST a
+  card-reply. The first reply button's `primary` style maps to `default` on
+  web — leading-button emphasis is a WA/Teams renderer convention that read as
+  a bug in the inbox.
+
+  **Agent → human reassignment requires a customer-facing acknowledgment.**
+  Adds `messages.hasRecentAgentReply(conversationId, withinSeconds)` and gates
+  `conv reassign --to=user:<id>` on it: the verb refuses with
+  `errorCode: 'no_customer_ack'` if the agent hasn't sent a `reply` /
+  `send_card` / `send_file` in the last 60 seconds. Verb description and
+  `prompt` rewritten as a 3-step handoff playbook so the agent is told
+  explicitly to acknowledge BEFORE flipping the assignee.
+
+  **Managed-WhatsApp adapter no longer races vault load.** The previous
+  `void loadRotation(...).catch(swallow)` warm-load could resolve after the
+  first outbound, throwing "vault not yet loaded" on the wire. The factory
+  now awaits the initial rotation load; `loadRotation` deduplicates concurrent
+  calls so subsequent adapter constructions for the same org pay an in-memory
+  hit. `ChannelAdapterFactory` now accepts `Promise<ChannelAdapter>`;
+  `registry.get()` is async; every caller (`outbound`, `inbound`,
+  `mention-notify`) awaits.
+
+  **Supervisor coaching wakes get a clearer playbook.** `wake/trigger.ts`
+  leads with `cat <conv>/internal-notes.md` so the model can't treat reading
+  the staff note as optional, then directs the agent to capture a durable
+  lesson in MEMORY.md. `wake/prompt.ts` reorders the system prompt so
+  `MEMORY.md` (renamed to "## Active lessons — apply these rules on every
+  reply") sits before AGENTS.md — durable rules ahead of static guidance.
+  `learning-proposals.ts` skips signals whose `notePreview` is present-but-blank
+  to avoid `Note: —` stubs.
+
+  **`agents.agent_threads*` renamed to `operator_threads*`** to disambiguate
+  from `harness.threads` (the conversation lane). Schema, seeds, services,
+  handlers, the standalone wake builder, and the operator-chat component all
+  updated atomically. No data migration — template scaffolding only.
+
+  Includes test coverage: `outbound-card.test.ts` (13 cases for WA interactive
+  shapes, fixture, fields/link-button, truncation, no-footer assertions);
+  `conv-reassign.test.ts` (4 cases covering happy path, block, staff bypass,
+  agent-target bypass); `messages.test.ts` extensions for `hasRecentAgentReply`;
+  `learning-proposals.test.ts` for the empty-note skip; thread test updates
+  for the rename.
+
+## 3.4.0
+
+### Minor Changes
+
+- [`e3d4817`](https://github.com/vobase/vobase/commit/e3d48170834b8be36413c7dcd8bee3cc14f0411e) Thanks [@mdluo](https://github.com/mdluo)! - # Changes module: history audit log + self-learn observer
+
+  The changes module previously only surfaced **pending** proposals. Once a staff reviewer approved or rejected one, the row simply vanished — no audit log, no "applied to /policies/refunds.md" feedback, no way to answer "who decided this and when?". And the self-learn loop was incomplete: `detectStaffSignals` was implemented and tested but no observer ever invoked it, so a staff `@`-mention or reply triggered a supervisor wake without ever turning into a memory entry the next wake could see.
+
+  ## What changed
+
+  ### `/changes` — Pending | History tabs
+
+  A new `<Tabs>` shell on `/changes` with URL-state via `validateSearch({ tab: z.enum(['pending','history']).optional() })`. The Pending tab keeps the existing FilterChip + ProposalRow grid. History adds:
+
+  - Day-grouped sticky headers (TUE 5 MAY · MON 4 MAY · …)
+  - Status filter chips: All / Approved / Rejected / Auto-applied
+  - Compact `<HistoryRow>` per decision with status badge, proposer + decider principals, headline target, and an expandable Problem / Outcome / Diff / decision-note panel
+  - Live-updates via the existing realtime SSE invalidation; no polling
+
+  ### `GET /api/changes/history`
+
+  New route on the changes module, gated by `requireOrganization`. Query params: `resourceModule?`, `status?` (any `ChangeStatus | 'all'`), `limit?` (1–500, default 100). Backed by `listDecided(organizationId, opts)` on `ChangeProposalsService` — returns proposals where `status IN ('approved','rejected','auto_written','superseded')` ordered by `COALESCE(decided_at, created_at) DESC`, with the same conversation→contactId join as the inbox so rows can render a clickable contact pill.
+
+  ### Approve / reject feedback
+
+  `<ProposalRow>` now fires a sonner toast on success: **"Change applied · `<resource>` updated · View in history"** for approve, **"Change rejected · Logged to history · View in history"** for reject. The action button navigates to `/changes?tab=history`. Approve/reject buttons disable when no authenticated user is present so the audit trail can never contain a fabricated principal — the previously-shipped `'staff:current'` literal fallback is gone.
+
+  ### Self-learn loop closed
+
+  New `wake/observers/learning-proposals.ts` wired into both `wake/conversation.ts` and `wake/standalone.ts`. At `agent_end` it runs `detectStaffSignals` on the per-wake event buffer and, for each non-trivial signal (supervisor / approval-rejected / internal-note from a staff author — `reassignment_note` is intentionally skipped because the agent never saw it), files an `auto_written` proposal on `agents:agent_memory` with a structured markdown-append body capturing author + ref + note preview. Because `agent_memory` is registered with `requiresApproval: false`, the proposal materializes immediately and lands in History as audit — no staff click required, but every learning is reviewable after the fact.
+
+  The observer only buffers `agent_start` / `internal_note_added` / `agent_end` events (not `message_update` / `llm_call` / `tool_*` — hundreds per turn) and cleans its buffer on `agent_aborted` to prevent leaks on aborted wakes. Duplicate-pending conflicts are swallowed; everything else surfaces via `logger.error`.
+
+  ### Service correctness
+
+  `insertProposal`'s duplicate-pending check is now scoped to pending-status inserts only. Auto-writes (`requiresApproval: false`) used to fail when an unrelated `pending` row existed on the same target — they now insert cleanly because the partial unique index only covers pending rows anyway.
+
+  ### Smaller cleanups
+
+  - Centralized `CHANGE_STATUS_VALUES` const-tuple in `modules/changes/schema.ts` so handlers + hooks share one source of truth instead of inlining the union
+  - `or(...statuses.map(eq))` → `inArray(status, …)` in `listDecided`
+  - Extracted `<HeadlineTarget>` and `<ProsePanel>` into `src/components/changes/` — they were previously byte-identical between proposal-row and history-row
+  - `useChangeHistory` queryKey uses primitives + `staleTime: 30_000` instead of polling every 30s
+
+  ## Seed updates
+
+  `modules/changes/seed.ts` now seeds five decided proposals (`PROP_APPROVED_SLACK`, `PROP_REJECTED_AGGRESSIVE`, `PROP_AUTO_DEREK`, `PROP_AUTO_AGENT_MEM`, `PROP_REJECTED_PRICEDROP`) so the History tab is non-empty on a fresh `bun run db:reset` and exercises every status variant.
+
+### Patch Changes
+
+- [`7c8fe1d`](https://github.com/vobase/vobase/commit/7c8fe1d06cdf30930e2c9af6b14f3198517c8474) Thanks [@mdluo](https://github.com/mdluo)! - # Fix: outbound dispatch + media + tenant scope
+
+  Agent replies (`reply`, `send_card`, `send_file`) and staff replies were persisted to the inbox but never reached the wire — both owned and managed (platform-proxy) WhatsApp. The web channel masked the bug because its `send()` is a no-op (the realtime push from the row insert delivers to browsers, but no Graph API call is ever made for WhatsApp).
+
+  ## What changed
+
+  ### `sendOutbound` seam wired end-to-end
+
+  A new install-time service (`installOutboundService`, mirroring the `installMessagesService` pattern) is the single seam for outbound delivery. After persisting their message row, `reply.ts`, `send-card.ts`, `send-file.ts`, and `staff-reply.ts` now call `sendOutbound`, which resolves the channel adapter via the registry, enforces the 24h messaging window for windowed channels, and calls `adapter.send()`.
+
+  Adapter resolution is **instance-keyed** — `registryGet(channel, config, instance.id)` — which is what makes managed-mode WhatsApp actually deliver. The managed adapter is constructed bound to the instance's vault rotation so the platform proxy receives correctly-signed requests.
+
+  ### Cross-tenant assertion
+
+  `SendOutboundInput` now requires `organizationId`. Inside `sendOutbound`, every conversation/contact/instance lookup asserts `row.organizationId === input.organizationId` before proceeding. Closes a cross-tenant exfiltration primitive: a wake on `org-A` could previously pass a `conversationId` from `org-B` (e.g. via prompt injection in customer content) and reach `org-B`'s wire signed with `org-B`'s vault keys.
+
+  ### Channel-aware recipient
+
+  The previous `contact.phone ?? contact.email ?? contact.id` fallback could send a nanoid as the wire address. `sendOutbound` now reads `adapter.contactIdentifierField` and throws cleanly if the contact lacks the required handle for that channel — no more silent message-loss for contacts missing a phone number.
+
+  ### Real media support for `send_file`
+
+  `send_file` now resolves the drive row via `filesServiceFor(orgId).get(driveFileId)`, downloads bytes via `getDriveStorage().bucket('drive').download(storageKey)`, maps the mime type to `image | video | audio | document`, and ships a real `OutboundMessage.media[]` payload. The WhatsApp adapter's existing bytes-upload path (`sendMedia` → Graph `/PHONE_ID/media` → upload id) handles the rest.
+
+  A scope check rejects sending another contact's private file: the drive file must be `organization`-scoped, or `contact`-scoped to the conversation's contact, or `agent`-scoped to the current agent. Closes a within-tenant lateral-access path where prompt injection from contact-X could leak contact-Y's private upload from the same org.
+
+  Virtual files (no `storageKey`, e.g. `MEMORY.md` overlays) throw cleanly.
+
+  ### `SendResult` failures surface to the agent
+
+  A new `throwIfFailed(result, toolName)` helper bubbles `success: false` outcomes out of every tool. `code === 'window_expired'` throws with a template-fallback hint (`Messaging window expired — fall back to a pre-approved template`); other failures bubble `code` + `error`. Replaces the silent `await sendOutbound(...)` that swallowed Graph 5xx and window-expired short-circuits.
+
+  ### Declarative per-adapter platform hints
+
+  Each channel adapter now owns its prompt hint alongside `agent.ts`:
+
+  | Adapter                                       | Export                 |
+  | --------------------------------------------- | ---------------------- |
+  | `modules/channels/adapters/web/agent.ts`      | `webPlatformHint`      |
+  | `modules/channels/adapters/whatsapp/agent.ts` | `whatsappPlatformHint` |
+
+  The umbrella `modules/channels/agent.ts` aggregates `platformHints: HarnessPlatformHint[]`, and `wake/platform-hints.ts` is now a thin registry built from that list. Adding a new channel adapter only touches its own folder. Vestigial `email`/`sms`/`voice` entries removed since no adapters back them today — re-add them in their adapter folder when wired.
+
+  ## Tests
+
+  Test stubs for the four sender paths now use counted-spy fakes that assert `sendOutbound` was called with the right `(toolName, organizationId, conversationId)`. A regression test for `window_expired` confirms the failure-path bubbles a tool error mentioning the template fallback. A regression on the wire path can no longer pass.
+
+  ## Migration
+
+  No schema changes. No new dependencies. No new pg-boss jobs. The `installOutboundService` call lands in `modules/channels/module.ts::init` — projects scaffolded from this template before this fix should re-pull the channels module init or call `installOutboundService(createOutboundService())` themselves at boot.
+
+  `ChannelOutboundEventSchema` was removed from `runtime/channel-events.ts` (no remaining consumers); inbound schema and `OUTBOUND_TOOL_NAMES` retained.
+
+  ## Deferred
+
+  The following were intentionally scoped out and remain follow-ups:
+
+  - `send_card` → real WhatsApp interactive payload (buttons / list pickers); currently flattens to plain text.
+  - `messages.status` state machine (`queued → sent → failed`) + delivery retry queue.
+  - E.164 normalization on WhatsApp `to:` at the egress boundary.
+  - Managed-mode env-fallback regression-guard (a config row that loses `mode: 'managed'` currently falls back to env-var creds).
+  - `runThreatScan` is still a `return { ok: true }` stub on the `send_file` path.
+  - `staff_reply` attachments persist on the row but only the text body flows to the wire.
+  - `installOutboundService` cross-test bleed sweep (pre-existing pattern across all `install*` services).
+
+- [#67](https://github.com/vobase/vobase/pull/67) [`fb8f6bd`](https://github.com/vobase/vobase/commit/fb8f6bd3d5a724b124a187b70307cacdf14531c6) Thanks [@TheSoggy](https://github.com/TheSoggy)! - # Fix theme FOUC bootstrap and echoes test setup
+
+  Two unrelated, mechanical fixes from running the unmodified scaffold:
+
+  **`index.html` theme bootstrap reads stale storage key.** The pre-paint FOUC-prevention script in `index.html` reads `localStorage.getItem("template-v2-theme")`, but `theme-provider.tsx` (and its test) write/read `vobase-theme`. This causes the bootstrap script to never find a saved preference and always default to `system`, producing a real flash on hydration for users who'd selected `light` or `dark`. Aligns the bootstrap with the actual storage key.
+
+  **`modules/channels/adapters/whatsapp/echoes.test.ts` missing contacts service install.** The test's `beforeAll` installs `conversations`, `messages`, `sessions`, `reactions`, and `channels` services but never installs `contacts`. Because `dispatchInbound` → `contacts.upsertByExternal` reads the contacts singleton, every test in the file throws `contacts/contacts: service not installed`. Adds the install matching the canonical pattern in `tests/helpers/attachments-fixture.ts`.
+
+  After these fixes: 1 previously failing test goes green (theme FOUC), and the `smb_message_echoes` tests pass cleanly when the file is run in isolation. (The echoes tests still fail in the full-suite run due to a separate cross-test DB-state pollution issue — filing a separate report.)
+
+## 3.3.0
+
+### Minor Changes
+
+- [`2964598`](https://github.com/vobase/vobase/commit/2964598ecf41eec727df4329be1132228b9421ab) Thanks [@mdluo](https://github.com/mdluo)! - # Drive (Upload + OCR) and WhatsApp Channel
+
+  Two end-to-end template features ship together, both already exercised by the canonical helpdesk scaffold.
+
+  ## Drive: upload, OCR, and inbound auto-ingest
+
+  The `drive` module is now a real agent filesystem. Staff and inbound channels both write through one `ingestUpload(input)` seam; readable artifacts are normalized to `.md` so the agent's bash sandbox can grep them.
+
+  - **Storage seam.** `ModuleInitCtx` now carries `storage: StorageAdapter` (local in dev, S3/R2 in prod). Modules consume a single adapter; no per-module file plumbing.
+  - **Upload pipeline.** `drive:process-file` job extracts text per mime, with a per-page readability gate for PDFs (`MIN_READABLE_CHARS_PER_PAGE = 40`, `MIN_PRINTABLE_RATIO = 0.6`) — pages that fail the gate are routed through OCR rather than trusting watermark glyphs.
+  - **OCR provider.** `lib/ocr-provider.ts` uses `@ai-sdk/openai` directly via `provider.chat(...)`. Bifrost mode → `google/gemini-2.0-flash`; direct mode → `models.gpt_mini`. Provider + `generateText` memoized so an N-page PDF reuses one handle.
+  - **Hybrid search.** New `drive_chunks` table backs pgvector + tsvector hybrid search. Post-rank phase batches chunk → file lookups (2 SELECTs total for a 10-hit search; pinned by `files-search.test.ts`).
+  - **Caption + binary stub.** Every file carries a deterministic 120-char `caption` projection (no LLM on the hot path). Binary files get a stub row plus the agent's new `request_caption` tool, which fires a `caption_ready` wake when extraction completes.
+  - **Cost ceilings.** Per-org daily budget gate at `modules/drive/service/budget.ts` reads `harness.tenant_cost_daily`. Jobs past the ceiling fail with `processingError = 'org_daily_budget_exceeded'` rather than uncapped spend.
+  - **Inbound auto-ingest.** WhatsApp inbound media (`MessageReceivedEvent.media[]`) auto-ingests under `/contacts/<id>/<channelInstanceId>/attachments/`. `messages.attachments` jsonb carries refs; `messages.md` materializer renders inline caption blocks per attachment.
+  - **Loser-of-race reap.** Concurrent webhook redeliveries (Meta retries 5xx up to 7 times) call `filesService.reapAttachmentRows(...)` from `createInboundMessage` on `channelExternalId` unique-violation, so duplicate drive rows never persist.
+  - **Drive UI.** `<DriveFileList>` gains drag-and-drop upload (folder-scoped overlay, multi-file with toast), per-row 3-dot menu (Rename inline, Delete via AlertDialog, Download original when display ext ≠ original ext), pending-uploads counter, status pill with `processingError` tooltip.
+  - **Failure paths.** Post-storage UPDATE failure deletes the just-uploaded storage object and marks the row `(failed, failed)` with a structured `processingError`. `markFailed` and embedding-fail catch in `jobs.ts` log via `@vobase/core` logger so operators can grep stderr.
+  - **Wake bus rename.** `INBOUND_TO_WAKE_JOB → AGENTS_WAKE_JOB`; pg-boss queue renamed to `'agents:wake'`. `WakeTriggerSchema` is `z.discriminatedUnion('trigger', [...])` with paired-shape compile-time drift guard.
+
+  ## WhatsApp channel
+
+  End-to-end Cloud API support across self-managed and platform-managed modes — see [`@vobase/core@0.36.0`](https://github.com/vobase/vobase/releases) for the underlying transport seam, envelope-encrypted vault, and 2-key HMAC sig v2 contract.
+
+  Template-side surfaces:
+
+  - **Embedded Signup.** `<WhatsAppSignupButton variant="hero" | "compact">` Facebook SDK launcher, server-side code exchange (`/signup/start` + `/signup/exchange`), nonce table bound to `(orgId, sessionId)` with 5-min expiry, mandatory `debug_token` validation, per-org rate limit (10/h), per-IP failure bucket (60/min).
+  - **Coexistence.** `smb_message_echoes` parsed and persisted as `role='staff', metadata.echoSource`. Echoes do NOT enqueue wake jobs, do NOT open the 24-hour service window, do NOT fan out `add_note`.
+  - **Platform-managed sandbox.** Tenant config carries only `{ mode: 'managed', platformChannelId, platformBaseUrl }` — zero Meta credentials at rest. TOCTOU-safe `upsertManagedInstance` via Postgres generated column + partial unique index.
+  - **24-hour service window.** `messaging.conversation_sessions` tracks open sessions per `(conversationId, channelInstanceId)`. Outbound dispatcher precheck returns `SendResult { code: 'window_expired' }` instead of attempting a doomed send.
+  - **Status FSM + reactions.** `messages.updateDeliveryStatus()` enforces `queued → sent → delivered → read` (no backward); `failed` terminal; never mutates `role`/`content`. Reactions write through new `messaging/service/reactions.ts` only — `check:shape` enforced.
+  - **Doctor.** `vobase channels:doctor :instanceId` runs `debug_token`, `subscribed_apps`, `phone_numbers`, `message_templates`, surfaces results in `<InstanceDoctorSheet>` with red/amber/green pills.
+  - **Channels admin UI.** Single unified `<ChannelsTable>` (DiceUI data-table) replaces the prior tile catalog. WhatsApp + Web channels coexist with a `<ModeChip>` per row. Row-action menu opens slide-over sheets for Doctor (WA), Templates (WA), Embed snippets (Web).
+  - **CLI verbs.** `vobase channels:list`, `vobase channels:instance:show :id`, `vobase channels:doctor :id`, `vobase channels:templates:sync :id`.
+  - **TRUST_PROXY_HOPS.** New env var defaults to `0` (ignore XFF) for prod safety. Operators behind a sanitizing proxy must set it explicitly.
+  - **Admin role gating.** `getRequireAdmin()` lazy accessor enforces `owner | admin` on every signup/managed/doctor mutation route.
+
+  ## Frontend bundle isolation
+
+  `check:bundle` extended to forbid `~/runtime` imports from `src/**` so backend code (auth handles, db client, jobs) cannot leak into the browser bundle.
+
+  ## Test coverage
+
+  - 23 new test files spanning e2e (caption-ready wake, attachment auto-ingest, attachment failure/orphan, inbound redelivery, loser-of-race reap, full ESU flow), integration (managed transport, echoes, doctor, signup nonces), unit (sessions FSM, reactions, dispatch routing, request-IP `TRUST_PROXY_HOPS`), and live smokes (`bun run smoke:wa` covering inbound, outbound echo, doctor, templates).
+  - 616 passing / 5 skipped / 1 todo at the end of the slice; 6 pre-existing failures (contacts service not installed in test env) unchanged.
+
+  ## Operational notes
+
+  - **Backfill:** ops needs to populate `tenant_environments` rows for existing managed tenants so the per-env webhook resolver targets the right `instanceUrl`. Falls back gracefully today.
+  - **Open follow-ups (non-blocking):** `Reassign default…` row action wired but disabled (needs AssigneeSelect popover); `mergeContacts(...)` is a JSDoc-only skeleton; vault `previous` decryption is eager per read (bounded by 60s rotation cache TTL — optional lazy follow-up); WA-inbound live smoke deferred until `META_WA_*` configured in dev.
+
+## 3.2.1
+
+### Patch Changes
+
+- Updated dependencies [[`02a1b87`](https://github.com/vobase/vobase/commit/02a1b87bfcab7645590802b04fbc7e0c57378568)]:
+  - @vobase/core@0.36.0
+
+## 3.2.0
+
+### Minor Changes
+
+- [`5c5c277`](https://github.com/vobase/vobase/commit/5c5c27784c91c96441918e0a5c42ace2b5833c77) Thanks [@mdluo](https://github.com/mdluo)! - End-to-end UI revamp of the template app: mobile-first shell, canonical layout
+  and card primitives, and a Craft-style information-forward look.
+
+  **Layout primitives.** New `PageLayout` / `PageHeader` / `PageBody` (in
+  `src/components/layout/page-layout.tsx`) — every top-level page now slots into
+  the same shell instead of hand-rolling section/header markup. Thirteen pages
+  migrated. PageBody defaults to a subtle gray (`bg-muted/40`) with edge-to-edge
+  horizontal padding; pages that want a centered column wrap their children in
+  `mx-auto w-full max-w-4xl` so the gray field extends behind the cards.
+
+  **Mobile-first AppShell + stack-and-push ListDetailLayout.** The shell renders a
+  desktop rail or a mobile bottom-nav based on viewport. List/detail surfaces
+  (inbox, team, contacts) push the detail pane onto a stack on mobile and reveal
+  an inline chevron back affordance in `PageHeader`. Rail and conversation list
+  are resizable + collapsible with persisted layout. Rail compacts at 80px
+  (snap-collapsed icon-only width) instead of 160px, and active state is read
+  from TanStack Router's `data-status="active"` attribute so the mobile
+  bottom-nav highlight finally renders correctly. PRIMARY_NAV order: Inbox,
+  Contacts, Agents, Changes, Drive.
+
+  **Canonical card surface.** New `InfoCard` / `InfoRow` / `InfoSection` in
+  `src/components/info` — `rounded-lg bg-background shadow-sm` with sibling
+  dividers, no border. shadcn `Card` aligned to the same surface (override
+  marker added). `SettingsCard` is now a thin alias. Pending-changes proposal
+  cards drop their border to match.
+
+  **Detail pages adopt InfoSection rows.** Contact, staff, and agent detail
+  pages restructured around `InfoSection` + `InfoRow`, with native columns
+  (email, phone, title, model, etc.) merged into the same surface as custom
+  attributes — label-left, white card, tight rows.
+
+  **Shared attribute primitives.** `AttributeTable` and `AttributeFieldControl`
+  lifted to `src/components/attributes`; the contacts and team modules drop
+  ~250 lines each of byte-near duplicate code in favor of 20-line bindings.
+  Server values now merge per non-dirty key (rather than bailing when any field
+  is dirty), and dirty entries whose definition has been removed upstream are
+  dropped — so admin-side def deletions are no longer masked.
+
+  **Drive section helper.** `DriveSection` consolidates the
+  `DriveProvider` + `DriveBrowser` + fixed-height `InfoCard` triplet that the
+  contact, staff, agent, and settings/account pages all repeated.
+
+  **Design tokens + Tailwind defaults.** New foreground mix scale, shadow
+  utility set, and z-index registry (`packages/template/src/styles`).
+  `text-mini` / `text-compact` retired in favor of Tailwind's default text
+  scale.
+
+  **Settings consolidated to one page.** The `/settings/account` placeholder
+  form is gone; the user-menu's top item is now a Profile link to the
+  authenticated user's `/team/<userId>` detail page. The remaining tabs
+  (Appearance, Notifications, API Keys) collapse into a single
+  InfoSection-stack `/settings` page (no tabs), mirroring the contact-detail
+  layout. `/settings` redirects to itself; the `account`, `profile`, `display`
+  sub-routes are deleted along with their no-op POST endpoints
+  (`/api/settings/account`, `/api/settings/appearance`, `/api/settings/display`).
+
+  **Auto-save settings.** Notifications auto-save with a 400 ms debounce and a
+  "Saving… → Saved → Save failed" indicator (toast on error). Theme + font
+  size are now treated as client-only state (theme-provider + documentElement
+  font-size) — no longer round-tripped through a stub server endpoint that
+  swallowed the writes.
+
+  **Real API keys.** The API Keys section was a placeholder POSTing to a
+  no-op endpoint. It now goes through the existing `auth/api-keys` service
+  (the same one that backs `cli-grant` for CLI device-grant auth):
+  `GET /api/settings/api-keys` lists summaries (id, name, prefix•start,
+  created, last-used), `POST` creates and returns the plaintext token once
+  in a green reveal banner with a Copy button, `DELETE :id` revokes (and
+  guards by ownership at the query). Tokens are sha256-hashed at rest and
+  the `key` field is excluded from list responses (with a regression test).
+  Created and last-used render via `RelativeTimeCard`.
+
+  **Smaller polish.** Rail nav badge sizing (text-xs / h-5), Add web channel
+  CTA size + 480px web preview track, redundant Drive list-page icon
+  removed, list-page action button icons no longer force `mr-2 size-4`
+  (`size=sm` slot spacing handles it).
+
+## 3.1.0
+
+### Minor Changes
+
+- [`26f886c`](https://github.com/vobase/vobase/commit/26f886c3567ac1a85b4294efb3ecf1bd6dc805bf) Thanks [@mdluo](https://github.com/mdluo)! - Three connected changes to the template's agent-facing surface:
+
+  **Audience tier model.** Verbs are now tagged with `audience: 'admin' | 'staff' | 'contact'`, and the AGENTS.md `## Commands` block + in-bash `vobase --help` filter to what the wake's tier can see. The wake's tier is derived from `(lane, triggerKind)`:
+
+  | `(lane, triggerKind)`                                                        | tier        |
+  | ---------------------------------------------------------------------------- | ----------- |
+  | `conversation + inbound_message`                                             | `'contact'` |
+  | `conversation + supervisor / approval_resumed / scheduled_followup / manual` | `'staff'`   |
+  | `standalone + operator_thread / heartbeat`                                   | `'staff'`   |
+  | `vobase` CLI binary with admin API key (outside the harness)                 | `'admin'`   |
+
+  Per-tier verb tagging applied across `messaging`, `team`, `drive`, `contacts`, `schedules`, `agents`, `system`. `team list` / `team get` / `conv reassign` / `drive propose` are `'contact'`-tier (every wake sees them); `messaging show` / `messaging close` / `agents show` are `'staff'`; everything else (`install`, `drive cat`, `system/*`, etc.) defaults to `'admin'` and is hidden from wakes. Filtering happens at the surface (visibility), not at dispatch — the bash sandbox doesn't hard-reject admin-tier verbs today.
+
+  **`add_note` extended with `mentions`; `conv ask-staff` removed.** The `vobase conv ask-staff` verb and the standalone `ask_staff` tool are deleted. Asking staff a question is now a parameter on `add_note`: pass `mentions: [<userId or displayName>, ...]` and the tool resolves each token against the staff roster, prepends `@DisplayName` tokens to the body, and writes `staff:<userId>` mention strings — the existing post-commit fan-out in `messaging/service/notes` enqueues a supervisor wake per mentioned staff. `conversationId` is now optional on `add_note` and defaults to the current wake's conversation; required only on standalone-lane wakes that need to leave a note on a different conversation. The mentions array is bounded (`maxItems: 16`, per-token `maxLength: 64`) and dedups same-staff references so neither `staff:u1` mentions nor `@Alice` body prefixes are duplicated.
+
+  **AGENTS.md preview HTTP route + lane-aware scratch.** New `GET /api/agents/definitions/:id/agents-md?lane=<>&triggerKind=<>&supervisorKind=<>` route renders the AGENTS.md preamble the agent would see for a given lane variant, used by the agent-edit page's lane switcher. The Plate renderer for the preview was rewired to `BasicBlocksPlugin` + `BasicMarksPlugin` and now omits `remarkMdx` (which silently truncated AGENTS.md at the first JSX-like token, e.g. `<id>` / `<2k` / `<file>`). Cross-org guards added on all four `/definitions/:id*` handlers so a session-authenticated user from one org can't preview / read / mutate / delete another org's agent. The new `WakeAgentsMdScratch` (`wake/agents-md-scratch.ts`) carries `(lane, triggerKind, supervisorKind)` to module-side AGENTS.md contributors, replacing prose-in-instructions: messaging now contributes lane-aware blocks for supervisor-coaching, ask-staff-answer, and standalone-no-customer wakes. `MERIGPT_INSTRUCTIONS` was trimmed in `modules/agents/seed.ts` to remove the sections now framework-emitted (lane rules, MEMORY.md routing, supervisor-wake handling).
+
+  Documentation: the template's `CLAUDE.md` "Agent harness" section now documents the canonical context names (`AgentContributions<WakeContext>` boot-time, `WakeContext` per-wake, "agent harness" as the informal term for `wake/`), the audience-tier derivation table, and a "Adding agent surfaces in a new module" recipe (declare `tools` / `materializers` / `agentsMd` / `roHints` on `agent.ts`; register verbs through `ctx.cli.register(...)` with the right `audience`).
+
+## 3.0.0
+
+### Major Changes
+
+- Promote template-v2 to the default `@vobase/template`. The prior template is archived to `legacy/template-v1/` (frozen, pinned to `@vobase/core@0.33.0`).
+
+  Breaking changes:
+
+  - Imperative composition replaces declarative `vobase.config.ts`. Tenants customize storage / auth / channels by editing the template source.
+  - WhatsApp env vars renamed from `WA_*` to `META_WA_*`.
+  - Knowledge-base, automation, and integrations modules removed (use v1 if needed). Mastra removed; agents now run on `@mariozechner/pi-agent-core`.
+  - Default dev DB DSN reverted to `:5432 / vobase`.
+  - `STORAGE_KEY` for theme localStorage renamed; users see system-default theme on first load after upgrade.
+
+  See `packages/template/CLAUDE.md` for the new module set and conventions.

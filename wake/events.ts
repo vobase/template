@@ -1,0 +1,564 @@
+/**
+ * Canonical `AgentEvent` union.
+ *
+ * Every event flowing through `EventBus`, `ObserverBus`, and the `conversation_events`
+ * journal is one of these variants. The journal's write path lives exclusively in
+ * `modules/agents/service/journal.ts` (one write path per domain).
+ */
+
+import type { ClassifiedErrorReason } from '@vobase/core'
+import { z } from 'zod'
+
+/**
+ * Conversation-lane triggers (always conversation-bound) plus standalone-lane
+ * triggers (thread- or schedule-bound). Standalone wakes carry a synthetic
+ * `conversationId` of the form `operator-<threadId>` or `heartbeat-<scheduleId>`
+ * downstream so the journal contract (`BaseEvent.conversationId: string`)
+ * stays satisfied without a schema migration. Producers should not invent
+ * the synthetic id — `wake/operator-thread-handler.ts` and `wake/heartbeat.ts`
+ * own the mapping.
+ */
+export type WakeTrigger =
+  | {
+      trigger: 'inbound_message'
+      conversationId: string
+      messageIds: string[]
+      /**
+       * Latest customer message body, inlined into the wake cue so the agent
+       * can decide without first running `cat …/CONVERSATION.md`. Optional for
+       * back-compat with legacy queue rows enqueued before the body was
+       * threaded through; the renderer falls back to a pointer-only cue when
+       * absent. Producers set this from the channel event content (or a
+       * synthesized "Customer tapped X" for card-reply taps).
+       */
+      body?: string
+      /**
+       * Drive paths of inbound media the customer attached to THIS wake's
+       * triggering message. Inlined into the cue so the agent can call
+       * `send_file --driveFileId=<path>` (or `request_caption`) without first
+       * `cat`ing CONVERSATION.md to discover the path. Each entry's `path` is
+       * the canonical bash-view drive path; `mimeType` lets the agent pick
+       * the right tool. Empty / absent for text-only inbounds. Optional for
+       * back-compat with legacy queue rows.
+       */
+      attachments?: Array<{ path: string; mimeType: string; sizeBytes: number }>
+    }
+  | {
+      trigger: 'approval_resumed'
+      conversationId: string
+      approvalId: string
+      decision: 'approved' | 'rejected'
+      note?: string
+    }
+  | {
+      trigger: 'staff_note'
+      conversationId: string
+      noteId: string
+      authorUserId: string
+      /**
+       * Set when staff @-mentioned a specific agent in the note. Causes the
+       * peer wake to boot that agent's own builder rather than the conversation
+       * assignee. Undefined for the assignee self-wake variant. Resolved at
+       * `addNote` post-commit fan-out time; never mutated downstream.
+       */
+      mentionedAgentId?: string
+      /**
+       * Note body, inlined into the wake cue so the agent doesn't have to cat
+       * CONVERSATION.md just to learn what the latest note says. Optional
+       * for back-compat with legacy queue rows; renderer falls back to a
+       * pointer-only cue when absent. Producer: `messaging/service/notes.ts`
+       * post-commit fan-out (the body it just inserted).
+       */
+      body?: string
+    }
+  | { trigger: 'scheduled_followup'; conversationId: string; reason: string; scheduledAt: Date; sourceWakeId?: string }
+  | { trigger: 'manual'; conversationId: string; reason: string; actorUserId: string }
+  | { trigger: 'operator_thread'; threadId: string; messageIds: string[]; threadMessage: string }
+  | { trigger: 'heartbeat'; scheduleId: string; intendedRunAt: Date; reason: string }
+  /**
+   * Drive caption / OCR finished for a binary-stub or extracted file the
+   * agent asked about (or that arrived as an inbound attachment). The wake
+   * fires conversation-bound so the agent re-reads `CONVERSATION.md` for the
+   * new caption block. Producer: `modules/drive/jobs.ts`'s `forceCaption`
+   * branch. See `wake/trigger.ts` for the renderer.
+   */
+  | {
+      trigger: 'caption_ready'
+      conversationId: string
+      fileId: string
+      /** Drive-relative path (e.g. `/policies/refunds.pdf`). Optional for back-compat. */
+      filePath?: string
+      /** Generated caption text. Optional for back-compat with legacy queue rows. */
+      caption?: string
+    }
+  /**
+   * Staff approved or rejected a change-proposal that was created during this
+   * conversation. The wake fires so the agent can acknowledge the decision
+   * to the customer (confirmation when approved; polite "sorry, we declined"
+   * with optional next-step suggestion when rejected). Producer:
+   * `modules/changes/service/proposals.ts::decideChangeProposal` post-commit.
+   * See `wake/trigger.ts` for the renderer.
+   */
+  | {
+      trigger: 'change_decided'
+      conversationId: string
+      proposalId: string
+      decision: 'approved' | 'rejected'
+      resourceModule: string
+      resourceType: string
+      resourceId: string
+      /** SME-friendly summary, copied verbatim from the proposal's `rationale`. */
+      summary: string | null
+      /** Staff-authored note. null for system rejections (`staff_rejected`, `threat_scan`). */
+      decidedNote: string | null
+      /** Staff user-id (`usr0...`) who made the decision. */
+      decidedBy: string
+    }
+  | {
+      trigger: 'conversation_reassigned'
+      conversationId: string
+      /** null when the conversation was previously unassigned. */
+      fromAssignee: string | null
+      /** e.g. 'agent:agt0abc' or 'user:usr0xyz' */
+      toAssignee: string
+      reason?: string
+    }
+  | {
+      trigger: 'approval_filed'
+      conversationId: string
+      approvalId: string
+      approvalSummary: string
+      /** Operator-thread routing target — the agent that filed the approval. */
+      filedByAgentId: string
+    }
+  | {
+      trigger: 'approval_decided'
+      /** Present so the renderer can reference if needed; routing uses filedByAgentId. */
+      conversationId: string
+      approvalId: string
+      decision: 'approve' | 'deny'
+      /** Pre-rendered at emit-time: 'staff Bob' / 'system' / etc. */
+      decidedByLabel: string
+      /** Carried through from approval_filed (denormalized at file-time). */
+      filedByAgentId: string
+      note?: string
+    }
+  | {
+      trigger: 'proposal_filed'
+      /** null when proposal isn't conversation-bound. */
+      conversationId: string | null
+      proposalId: string
+      proposalSummary: string
+      resourceModule: string
+      resourceType: string
+      /** Operator-thread routing target — the agent that filed the proposal. */
+      proposedByAgentId: string
+    }
+  | {
+      trigger: 'proposal_decided'
+      /** null when proposal isn't conversation-bound. */
+      conversationId: string | null
+      proposalId: string
+      decision: 'approve' | 'reject'
+      /** Routing target — carried through from proposal_filed. */
+      proposedByAgentId: string
+      note?: string
+    }
+
+export type WakeTriggerKind = WakeTrigger['trigger']
+
+/**
+ * Zod mirror of `WakeTrigger`. Used by `wake/inbound.ts`'s payload schema so
+ * pg-boss-delivered triggers are validated at the wake-handler boundary.
+ *
+ * Drift guard: the paired-shape compile-time assertion below locks the Zod
+ * inferred type to the TS union. If TS errors there, you added a variant to
+ * one form but not the other.
+ */
+export const WakeTriggerSchema = z.discriminatedUnion('trigger', [
+  z.object({
+    trigger: z.literal('inbound_message'),
+    conversationId: z.string(),
+    messageIds: z.array(z.string()),
+    body: z.string().optional(),
+    attachments: z.array(z.object({ path: z.string(), mimeType: z.string(), sizeBytes: z.number() })).optional(),
+  }),
+  z.object({
+    trigger: z.literal('approval_resumed'),
+    conversationId: z.string(),
+    approvalId: z.string(),
+    decision: z.enum(['approved', 'rejected']),
+    note: z.string().optional(),
+  }),
+  z.object({
+    trigger: z.literal('staff_note'),
+    conversationId: z.string(),
+    noteId: z.string(),
+    authorUserId: z.string(),
+    mentionedAgentId: z.string().optional(),
+    body: z.string().optional(),
+  }),
+  z.object({
+    trigger: z.literal('scheduled_followup'),
+    conversationId: z.string(),
+    reason: z.string(),
+    scheduledAt: z.coerce.date(),
+    sourceWakeId: z.string().optional(),
+  }),
+  z.object({
+    trigger: z.literal('manual'),
+    conversationId: z.string(),
+    reason: z.string(),
+    actorUserId: z.string(),
+  }),
+  z.object({
+    trigger: z.literal('operator_thread'),
+    threadId: z.string(),
+    messageIds: z.array(z.string()),
+    threadMessage: z.string(),
+  }),
+  z.object({
+    trigger: z.literal('heartbeat'),
+    scheduleId: z.string(),
+    intendedRunAt: z.coerce.date(),
+    reason: z.string(),
+  }),
+  z.object({
+    trigger: z.literal('caption_ready'),
+    conversationId: z.string(),
+    fileId: z.string(),
+    filePath: z.string().optional(),
+    caption: z.string().optional(),
+  }),
+  z.object({
+    trigger: z.literal('change_decided'),
+    conversationId: z.string(),
+    proposalId: z.string(),
+    decision: z.enum(['approved', 'rejected']),
+    resourceModule: z.string(),
+    resourceType: z.string(),
+    resourceId: z.string(),
+    summary: z.string().nullable(),
+    decidedNote: z.string().nullable(),
+    decidedBy: z.string(),
+  }),
+  z.object({
+    trigger: z.literal('conversation_reassigned'),
+    conversationId: z.string(),
+    fromAssignee: z.string().nullable(),
+    toAssignee: z.string(),
+    reason: z.string().optional(),
+  }),
+  z.object({
+    trigger: z.literal('approval_filed'),
+    conversationId: z.string(),
+    approvalId: z.string(),
+    approvalSummary: z.string(),
+    filedByAgentId: z.string(),
+  }),
+  z.object({
+    trigger: z.literal('approval_decided'),
+    conversationId: z.string(),
+    approvalId: z.string(),
+    decision: z.enum(['approve', 'deny']),
+    decidedByLabel: z.string(),
+    filedByAgentId: z.string(),
+    note: z.string().optional(),
+  }),
+  z.object({
+    trigger: z.literal('proposal_filed'),
+    conversationId: z.string().nullable(),
+    proposalId: z.string(),
+    proposalSummary: z.string(),
+    resourceModule: z.string(),
+    resourceType: z.string(),
+    proposedByAgentId: z.string(),
+  }),
+  z.object({
+    trigger: z.literal('proposal_decided'),
+    conversationId: z.string().nullable(),
+    proposalId: z.string(),
+    decision: z.enum(['approve', 'reject']),
+    proposedByAgentId: z.string(),
+    note: z.string().optional(),
+  }),
+])
+
+// Drift guard: WakeTrigger and WakeTriggerSchema must stay in sync.
+// If TS errors here, you added a variant to one but not the other.
+const _wakeTriggerSchemaShape: WakeTrigger = {} as z.infer<typeof WakeTriggerSchema>
+const _wakeTriggerTypeShape: z.infer<typeof WakeTriggerSchema> = {} as WakeTrigger
+void _wakeTriggerSchemaShape
+void _wakeTriggerTypeShape
+
+/** Task tag threaded through every LLM call — see `PluginContext.llmCall()`. */
+export type LlmTask =
+  | 'agent.turn'
+  | 'scorer.answer_relevancy'
+  | 'scorer.faithfulness'
+  | 'moderation'
+  | 'memory.distill'
+  | 'learn.triage'
+  | 'drive.caption.image'
+  | 'drive.caption.video'
+  | 'drive.extract.pdf'
+  | 'intent.classify'
+
+export type AgentEndReason = 'complete' | 'blocked' | 'aborted' | 'error'
+
+interface BaseEvent {
+  ts: Date
+  /** Stable identifier for the specific wake that produced this event. */
+  wakeId: string
+  conversationId: string
+  organizationId: string
+  turnIndex: number
+}
+
+export type AgentStartEvent = BaseEvent & {
+  type: 'agent_start'
+  agentId: string
+  trigger: WakeTriggerKind
+  triggerPayload: WakeTrigger
+  systemHash: string
+}
+
+export type TurnStartEvent = BaseEvent & { type: 'turn_start' }
+export type TurnEndEvent = BaseEvent & {
+  type: 'turn_end'
+  tokensIn: number
+  tokensOut: number
+  costUsd: number
+}
+
+export type MessageStartEvent = BaseEvent & {
+  type: 'message_start'
+  messageId: string
+  role: 'assistant' | 'tool' | 'user' | 'system'
+}
+export type MessageUpdateEvent = BaseEvent & {
+  type: 'message_update'
+  messageId: string
+  delta: string
+}
+export type MessageEndEvent = BaseEvent & {
+  type: 'message_end'
+  messageId: string
+  role: 'assistant' | 'tool' | 'user' | 'system'
+  content: string
+  reasoning?: string
+  tokenCount?: number
+  finishReason?: string
+}
+
+export type ToolExecutionStartEvent = BaseEvent & {
+  type: 'tool_execution_start'
+  toolCallId: string
+  toolName: string
+  args: unknown
+}
+export type ToolExecutionUpdateEvent = BaseEvent & {
+  type: 'tool_execution_update'
+  toolCallId: string
+  update: unknown
+}
+export type ToolExecutionEndEvent = BaseEvent & {
+  type: 'tool_execution_end'
+  toolCallId: string
+  toolName: string
+  result: unknown
+  isError: boolean
+  latencyMs: number
+}
+
+export type LlmCallEvent = BaseEvent & {
+  type: 'llm_call'
+  task: LlmTask
+  model: string
+  provider: string
+  tokensIn: number
+  tokensOut: number
+  cacheReadTokens: number
+  costUsd: number
+  latencyMs: number
+  cacheHit: boolean
+}
+
+export type AgentEndEvent = BaseEvent & {
+  type: 'agent_end'
+  reason: AgentEndReason
+}
+
+export type ApprovalRequestedEvent = BaseEvent & {
+  type: 'approval_requested'
+  approvalId: string
+  toolName: string
+}
+export type ApprovalDecidedEvent = BaseEvent & {
+  type: 'approval_decided'
+  approvalId: string
+  decision: 'approved' | 'rejected'
+  decidedByUserId: string
+}
+
+export type InternalNoteAddedEvent = BaseEvent & {
+  type: 'internal_note_added'
+  noteId: string
+  authorType: 'agent' | 'staff' | 'system'
+}
+
+// ─── Channel + Scheduler events (Phase 2) ───────────────────────────────────
+// Note: tool_call_start/tool_call_end are intentionally absent — the existing
+// tool_execution_start/end cover this seam; renaming would collide with Phase 1
+// test fixtures.
+
+export type ChannelInboundAgentEvent = BaseEvent & {
+  type: 'channel_inbound'
+  /** Channel that delivered the message (e.g. 'web', 'whatsapp'). */
+  channelType: string
+  /** Provider-assigned message ID — used for idempotent dedup. */
+  externalMessageId: string
+  /** Resolved contact ID if available at event emission time. */
+  contactId?: string
+}
+
+export type ChannelOutboundAgentEvent = BaseEvent & {
+  type: 'channel_outbound'
+  channelType: string
+  /** Tool that triggered the outbound dispatch (e.g. 'reply_contact', 'send_card'). */
+  toolName: string
+  contactId: string
+}
+
+export type WakeScheduledEvent = BaseEvent & {
+  type: 'wake_scheduled'
+  trigger: WakeTriggerKind
+  scheduledAt: Date
+  /** Wake that scheduled this one (present for scheduled_followup chains). */
+  sourceWakeId?: string
+}
+
+// ─── Change-proposal events ────────────────────────────────────────────────
+
+export type ChangeProposedEvent = BaseEvent & {
+  type: 'change_proposed'
+  proposalId: string
+  resourceModule: string
+  resourceType: string
+}
+export type ChangeApprovedEvent = BaseEvent & {
+  type: 'change_approved'
+  proposalId: string
+  writeId: string
+}
+export type ChangeRejectedEvent = BaseEvent & {
+  type: 'change_rejected'
+  proposalId: string
+  reason: string
+}
+
+// ─── Budget / abort / cache events ──────────────────────────────────────────
+
+export type BudgetWarningEvent = BaseEvent & {
+  type: 'budget_warning'
+  /** 'soft' = ≥70% threshold; 'hard' = ≥100% threshold (loop broken). */
+  phase: 'soft' | 'hard'
+  turnsConsumed: number
+  spentUsd: number
+}
+
+export type ErrorClassifiedEvent = BaseEvent & {
+  type: 'error_classified'
+  reason: ClassifiedErrorReason
+  providerMessage: string
+  httpStatus?: number
+  retryAttempt: number
+}
+
+export type ToolResultPersistedEvent = BaseEvent & {
+  type: 'tool_result_persisted'
+  toolCallId: string
+  toolName: string
+  /** Absolute path inside /tmp/ where the full result was spilled. */
+  path: string
+  originalByteLength: number
+}
+
+export type SteerInjectedEvent = BaseEvent & {
+  type: 'steer_injected'
+  /** The steer text injected as the next user message. */
+  text: string
+}
+
+export type WakeRefusedEvent = BaseEvent & {
+  type: 'wake_refused'
+  reason: 'daily_ceiling'
+}
+
+export type AgentAbortedEvent = BaseEvent & {
+  type: 'agent_aborted'
+  /** Human-readable reason string from `AbortContext.reason` (or 'external' if unset). */
+  reason: string
+  /**
+   * Where in the turn the abort was detected.
+   * 'pre_tool'  — before any tool call started (includes LLM stream phase).
+   * 'in_tool'   — while a tool was executing (tool ran to completion).
+   * 'post_tool' — after a tool completed, before the next one started.
+   * Lets restart-recovery distinguish intentional abort from crash.
+   */
+  abortedAt: 'pre_tool' | 'in_tool' | 'post_tool'
+}
+
+// ─── Moderation + scorer events (Phase 3) ───────────────────────────────────
+
+export type ModerationBlockedEvent = BaseEvent & {
+  type: 'moderation_blocked'
+  /** Tool call that triggered the block (matches approval_requested.toolName convention). */
+  toolName: string
+  toolCallId: string
+  /** Rule that fired — e.g. 'policy.refund_cap', 'threat.prompt_injection'. */
+  ruleId: string
+  reason: string
+}
+
+export type ScorerRecordedEvent = BaseEvent & {
+  type: 'scorer_recorded'
+  /** Matches `modules/agents/schema.ts agent_scores.scorer_id` (e.g. 'answer_relevancy'). */
+  scorerId: string
+  /** 0..1 range — enforced by the observer writing the row. */
+  score: number
+  /** Link back to the LLM call that produced the rating (scorer_recorded fires after the scorer's own `llm_call`). */
+  sourceLlmTask: LlmTask
+}
+
+export type AgentEvent =
+  | AgentStartEvent
+  | TurnStartEvent
+  | TurnEndEvent
+  | MessageStartEvent
+  | MessageUpdateEvent
+  | MessageEndEvent
+  | ToolExecutionStartEvent
+  | ToolExecutionUpdateEvent
+  | ToolExecutionEndEvent
+  | LlmCallEvent
+  | AgentEndEvent
+  | ApprovalRequestedEvent
+  | ApprovalDecidedEvent
+  | InternalNoteAddedEvent
+  | ChangeProposedEvent
+  | ChangeApprovedEvent
+  | ChangeRejectedEvent
+  | ModerationBlockedEvent
+  | ScorerRecordedEvent
+  | ChannelInboundAgentEvent
+  | ChannelOutboundAgentEvent
+  | WakeScheduledEvent
+  | BudgetWarningEvent
+  | ErrorClassifiedEvent
+  | ToolResultPersistedEvent
+  | SteerInjectedEvent
+  | WakeRefusedEvent
+  | AgentAbortedEvent
+
+export type AgentEventType = AgentEvent['type']

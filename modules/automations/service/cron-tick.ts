@@ -1,0 +1,90 @@
+/**
+ * Cron-tick driver — runs once per `automations:cron-tick` invocation, walks
+ * every enabled automation rule, and emits a `heartbeat` trigger per ready row.
+ *
+ * Two pieces of safety:
+ *   1. **Idempotency.** Each rule's idempotency key is
+ *      `(scheduleId, intendedRunAt)`. `recordTick` returns `firstFire: true`
+ *      only on the first writer, so a duplicate tick across workers is a
+ *      no-op.
+ *   2. **Failure isolation.** A single rule's emitter throwing must not
+ *      starve siblings — errors go to the logger and the loop continues.
+ */
+
+import type { HeartbeatTrigger } from '@modules/automations/jobs'
+import { automationsService } from '@modules/automations/service/automations'
+
+export interface CronTickDeps {
+  emitHeartbeat: (trigger: HeartbeatTrigger) => Promise<void>
+  /**
+   * Returns the set of `organizationId`s that have opted out of heartbeat wakes.
+   * Called once per tick so a 1000-org sweep does one batched read instead of
+   * one round-trip per schedule. Disabled orgs are filtered before
+   * `recordTick`, so they don't burn idempotency rows either. Optional — when
+   * omitted no orgs are filtered (used by unit tests).
+   */
+  disabledOrgIds?: () => Promise<Set<string>>
+  /** Override clock — tests pin to a deterministic now. */
+  now?: () => Date
+  log?: (msg: string, meta?: Record<string, unknown>) => void
+}
+
+export interface CronTickResult {
+  /** Number of rules that emitted a heartbeat this tick. */
+  fired: number
+  /** Number of rules that were ready but de-duped to a previous tick. */
+  duplicates: number
+  /** Rules whose emit threw. */
+  errors: number
+}
+
+/**
+ * Drive one round of the cron sweeper. Caller invokes per pg-boss tick (or
+ * per minute in dev). Pulls every enabled rule globally in one query so
+ * the cron job doesn't need an org list — heartbeats from all tenants ride
+ * the same tick.
+ */
+export async function tickCron(deps: CronTickDeps): Promise<CronTickResult> {
+  const now = (deps.now ?? (() => new Date()))()
+  const intendedRunAt = roundDownToMinute(now)
+  const result: CronTickResult = { fired: 0, duplicates: 0, errors: 0 }
+
+  const disabledOrgs = (await deps.disabledOrgIds?.()) ?? new Set<string>()
+
+  const enabled = await automationsService.listAllEnabled()
+  for (const row of enabled) {
+    if (disabledOrgs.has(row.organizationId)) {
+      deps.log?.('automations.tick: org has heartbeats disabled — skipping', {
+        scheduleId: row.id,
+        organizationId: row.organizationId,
+      })
+      continue
+    }
+    try {
+      const tick = await automationsService.recordTick({ scheduleId: row.id, intendedRunAt })
+      if (!tick.firstFire) {
+        result.duplicates += 1
+        continue
+      }
+      await deps.emitHeartbeat({
+        kind: 'heartbeat',
+        scheduleId: row.id,
+        agentId: row.agentId,
+        organizationId: row.organizationId,
+        intendedRunAt: intendedRunAt.toISOString(),
+        cron: row.cron,
+      })
+      result.fired += 1
+    } catch (err) {
+      deps.log?.('automations.tick: emit failed', { scheduleId: row.id, err: String(err) })
+      result.errors += 1
+    }
+  }
+  return result
+}
+
+function roundDownToMinute(d: Date): Date {
+  const out = new Date(d)
+  out.setUTCSeconds(0, 0)
+  return out
+}

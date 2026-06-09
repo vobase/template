@@ -1,0 +1,341 @@
+/**
+ * Standalone-lane wake-config assembly. Standalone wakes are NOT conversation-bound —
+ * they fire from `operator_threads` (staff posting in the right-rail chat) or
+ * from cron heartbeats (scheduled review-and-plan flows). Both produce a wake
+ * over the org's full virtual filesystem with a different RO frame, a
+ * different side-load (no transcript, no contact block), and different tool
+ * surface (`update_contact`, `add_note`, `create_schedule`, …).
+ *
+ * Synthetic conversationId: BaseEvent requires a string, so standalone wakes
+ * use `operator-<threadId>` / `heartbeat-<scheduleId>`. The journal stays
+ * queryable; consumers that need to distinguish standalone events filter on
+ * the prefix.
+ */
+
+import { buildAuthLookup } from '@auth/lookup'
+import { type AgentDefinition, operatorThreads } from '@modules/agents/schema'
+import { getCliRegistry } from '@modules/agents/service/cli-registry'
+import * as syntheticIds from '@modules/agents/service/synthetic-ids'
+import { threads as threadsApi } from '@modules/agents/service/threads'
+import { findNotificationChannel } from '@modules/channels/service/instances'
+import { filesServiceFor } from '@modules/drive/service/files'
+import type { AgentContributions, SideLoadContributor, WakeRuntime } from '@vobase/core'
+import { DirtyTracker, journalGetLastWakeTail, type OnEventListener } from '@vobase/core'
+import { eq } from 'drizzle-orm'
+import { nanoid } from 'nanoid'
+
+import {
+  type BaseWakeDeps,
+  buildIndexFileMaterializer,
+  buildJournalAdapter,
+  buildSseListener,
+  capStaffIdsForBudgetHeader,
+  composeHooks,
+  resolveStaffIdsForOrg,
+} from './build-base'
+import type { WakeContext } from './context'
+import type { WakeConfig } from './conversation'
+import type { WakeTrigger } from './events'
+import { createModel, resolveApiKey } from './llm'
+import { setupMessageHistory } from './message-history'
+import { createNotificationMirrorObserver } from './observers/notification-mirror'
+import { createWorkspaceSyncListener } from './observers/workspace-sync'
+import { buildFrozenPrompt } from './prompt'
+import { resolveTriggerSpec } from './trigger'
+import { buildStandaloneReadOnlyConfig, createWorkspace } from './workspace'
+
+export type StandaloneTriggerKind = 'operator_thread' | 'heartbeat'
+
+export interface StandaloneWakeConfigInput {
+  data: {
+    organizationId: string
+    triggerKind: StandaloneTriggerKind
+    /** For 'operator_thread' wakes. Required when triggerKind === 'operator_thread'. */
+    threadId?: string
+    /** Verbatim staff message that woke the standalone agent. Surfaces in side-load. */
+    threadMessage?: string
+    /** For 'heartbeat' wakes. Required when triggerKind === 'heartbeat'. */
+    scheduleId?: string
+    /** For 'heartbeat' wakes. Pinned at trigger time so retries are deterministic. */
+    intendedRunAt?: Date
+    /** For 'heartbeat' wakes. Free-form description. */
+    reason?: string
+  }
+  agentId: string
+  agentDefinition: AgentDefinition
+  contributions: AgentContributions<WakeContext>
+  deps: BaseWakeDeps
+}
+
+/**
+ * Synthetic conversationId derived from the wake target. Re-exported from the
+ * shared `synthetic-ids` module so frontend (workspace tree / layout) and
+ * backend (this build config) read from one source of truth.
+ */
+export function standaloneConversationId(input: StandaloneWakeConfigInput['data']): string {
+  if (input.triggerKind === 'operator_thread') {
+    if (!input.threadId) throw new Error('standaloneConversationId: threadId required for operator_thread wake')
+    return syntheticIds.operatorConversationId({ triggerKind: 'operator_thread', threadId: input.threadId })
+  }
+  if (!input.scheduleId) throw new Error('standaloneConversationId: scheduleId required for heartbeat wake')
+  return syntheticIds.operatorConversationId({ triggerKind: 'heartbeat', scheduleId: input.scheduleId })
+}
+
+/**
+ * Build the standalone-lane wake config. Mirrors the conversation-lane body but
+ * skips every conversation-bound piece: no `resolveSessionContext`, no
+ * messaging materializers, no `conversationSideLoad`, no idle-resumption
+ * contributor.
+ */
+export async function standaloneWakeConfig(input: StandaloneWakeConfigInput): Promise<WakeConfig> {
+  const { data, agentId, agentDefinition, contributions, deps } = input
+  const conversationId = standaloneConversationId(data)
+  const wakeId = nanoid(10)
+
+  const drive = filesServiceFor(data.organizationId)
+  const staffIds = await resolveStaffIdsForOrg(data.organizationId)
+  const budgetHeaderStaffIds = capStaffIdsForBudgetHeader(staffIds, deps.logger)
+  const authLookup = buildAuthLookup(deps.db)
+
+  const roConfig = buildStandaloneReadOnlyConfig({ agentId, staffIds, roHints: contributions.roHints })
+
+  // Standalone-lane catalogue — tools opt in via their `lane` field
+  // (`'standalone'` or `'both'`). The wake harness never sees customer-facing
+  // tools here because no standalone tool tags itself with that lane.
+  const laneTools = contributions.tools.filter((t) => t.lane === 'standalone' || t.lane === 'both')
+
+  // Standalone-lane wakes are always staff-initiated (operator-thread or
+  // heartbeat); customer-tier verbs are not in scope here.
+  const audienceTier: 'staff' = 'staff'
+
+  const wakeCtx: WakeContext = {
+    organizationId: data.organizationId,
+    agentId,
+    conversationId,
+    drive,
+    staffIds,
+    budgetHeaderStaffIds,
+    authLookup,
+    agentDefinition,
+    tools: laneTools,
+    agentsMdContributors: contributions.agentsMd,
+    lane: 'standalone',
+    triggerKind: data.triggerKind,
+    audienceTier,
+  }
+
+  const wakeMaterializers = [
+    ...contributions.materializers.flatMap((f) => f(wakeCtx)),
+    buildIndexFileMaterializer({ organizationId: data.organizationId }),
+  ]
+
+  const workspace = await createWorkspace({
+    lane: 'standalone',
+    organizationId: data.organizationId,
+    agentId,
+    contactId: '',
+    channelInstanceId: '',
+    conversationId,
+    wakeId,
+    agentDefinition,
+    registry: getCliRegistry(),
+    audienceTier,
+    materializers: wakeMaterializers,
+    drivePort: drive,
+    readOnlyConfig: roConfig,
+  })
+
+  const frozen = await buildFrozenPrompt({
+    bash: workspace.bash,
+    agentDefinition,
+    organizationId: data.organizationId,
+    contactId: '',
+    channelInstanceId: '',
+  })
+
+  const dirtyTracker = new DirtyTracker(workspace.initialSnapshot, roConfig.writablePrefixes, [...roConfig.memoryPaths])
+  const workspaceSyncListener = createWorkspaceSyncListener({
+    fs: workspace.innerFs,
+    tracker: dirtyTracker,
+    organizationId: data.organizationId,
+    agentId,
+    contactId: '',
+    drive,
+    logger: deps.logger,
+  })
+
+  const history = await setupMessageHistory({ db: deps.db, agentId, conversationId })
+
+  const trigger: WakeTrigger = buildStandaloneTrigger(data)
+  const capability = resolveTriggerSpec(trigger.trigger)
+
+  const sseListener = buildSseListener({ logPrefix: capability.logPrefix, realtime: null })
+
+  // Operator-thread bridge: mirror the agent's terminal text reply into
+  // `operator_thread_messages` so the staff-facing operator chat UI displays it.
+  // Without this the harness journal (`harness.messages`) carries the reply
+  // but the right-rail / full-page chat reads only `operator_thread_messages`
+  // and the thread looks dead. Heartbeat wakes are intentionally excluded:
+  // they have no `operator_threads` row to write into.
+  //
+  // Filter on `role === 'assistant'` + non-empty `content` so tool-call-only
+  // turns (which the harness also emits as `message_end`) don't surface in
+  // the operator transcript as empty bubbles.
+  const operatorThreadBridgeListener: OnEventListener<WakeTrigger> | null =
+    data.triggerKind === 'operator_thread' && data.threadId
+      ? (() => {
+          const threadId = data.threadId
+          return async (event) => {
+            if (event.type !== 'message_end') return
+            const ev = event as { type: 'message_end'; role?: string; content?: string }
+            if (ev.role !== 'assistant') return
+            const content = (ev.content ?? '').trim()
+            if (!content) return
+            try {
+              await threadsApi.appendMessage({ threadId, role: 'assistant', content })
+            } catch (err) {
+              console.error('[wake:solo] operator-thread bridge appendMessage failed:', err)
+            }
+          }
+        })()
+      : null
+
+  // Notification-mirror observer: for operator-thread wakes, also mirror the
+  // assistant's terminal text reply OUT through the org's notification-tier
+  // WhatsApp number back to the staff member's personal phone. Resolve both
+  // identity inputs at wake-builder time (frozen-snapshot discipline — no
+  // mid-turn DB lookups) and pass `null` / `false` when the row is missing
+  // so the observer no-ops cleanly.
+  const notificationMirrorListener: OnEventListener<WakeTrigger> | null =
+    data.triggerKind === 'operator_thread' && data.threadId
+      ? await (async () => {
+          const threadId = data.threadId
+          if (!threadId) return null
+          const [thread] = await deps.db
+            .select({ createdBy: operatorThreads.createdBy })
+            .from(operatorThreads)
+            .where(eq(operatorThreads.id, threadId))
+            .limit(1)
+          const createdBy = thread?.createdBy ?? null
+          const notifChannel = await findNotificationChannel(data.organizationId)
+          return createNotificationMirrorObserver({
+            organizationId: data.organizationId,
+            threadId,
+            agentName: agentDefinition.name,
+            db: deps.db,
+            staffUserId: createdBy,
+            notificationChannelInstanceId: notifChannel?.id ?? null,
+            logger: deps.logger,
+          })
+        })()
+      : null
+
+  const standaloneBriefSideLoad: SideLoadContributor = (_ctx) =>
+    Promise.resolve([
+      {
+        kind: 'custom',
+        priority: 100,
+        render: () => renderStandaloneBrief(data),
+      },
+    ])
+
+  const model = createModel(agentDefinition.model)
+
+  return {
+    organizationId: data.organizationId,
+    agentId,
+    contactId: '',
+    conversationId,
+
+    agentDefinition: {
+      model: agentDefinition.model,
+      instructions: agentDefinition.instructions,
+      workingMemory: agentDefinition.workingMemory,
+    },
+    model,
+    getApiKey: () => resolveApiKey(model),
+
+    systemPrompt: frozen.system,
+    systemHash: frozen.systemHash,
+
+    trigger,
+    triggerKind: trigger.trigger,
+    renderTrigger: (t: WakeTrigger | undefined) => (t ? capability.render(t, {}) : 'Standalone wake (no trigger).'),
+
+    workspace: { bash: workspace.bash, innerFs: workspace.innerFs },
+    runtime: { fs: workspace.innerFs, tracker: dirtyTracker } satisfies WakeRuntime,
+
+    ...composeHooks({
+      capability,
+      laneTools,
+      contributions,
+      coreListeners: [
+        sseListener,
+        workspaceSyncListener as OnEventListener<WakeTrigger>,
+        ...(operatorThreadBridgeListener ? [operatorThreadBridgeListener] : []),
+        ...(notificationMirrorListener ? [notificationMirrorListener] : []),
+      ],
+    }),
+    materializers: wakeMaterializers,
+    sideLoadContributors: [standaloneBriefSideLoad, ...contributions.sideLoad],
+
+    extraCustomSideLoad: [],
+    agentsMdChain: {},
+
+    getLastWakeTail: journalGetLastWakeTail,
+    journalAppend: buildJournalAdapter(),
+    loadMessageHistory: history.loadMessageHistory,
+    onTurnEndSnapshot: history.onTurnEndSnapshot,
+
+    maxTurns: 10,
+    logger: deps.logger,
+  }
+}
+
+function buildStandaloneTrigger(data: StandaloneWakeConfigInput['data']): WakeTrigger {
+  if (data.triggerKind === 'operator_thread') {
+    if (!data.threadId) throw new Error('operator wake: threadId required')
+    return {
+      trigger: 'operator_thread',
+      threadId: data.threadId,
+      messageIds: [],
+      threadMessage: data.threadMessage ?? '',
+    }
+  }
+  if (!data.scheduleId || !data.intendedRunAt) {
+    throw new Error('heartbeat wake: scheduleId + intendedRunAt required')
+  }
+  return {
+    trigger: 'heartbeat',
+    scheduleId: data.scheduleId,
+    intendedRunAt: data.intendedRunAt,
+    reason: data.reason ?? 'scheduled heartbeat',
+  }
+}
+
+function renderStandaloneBrief(data: StandaloneWakeConfigInput['data']): string {
+  const lines: string[] = ['# Operator Brief', '']
+  if (data.triggerKind === 'operator_thread') {
+    // The staff member's message is the bare user-turn text (see
+    // `renderOperatorThread` in `wake/trigger.ts`). This brief is the only
+    // place the per-wake instructions live: it is side-loaded onto the
+    // current turn only, so the replayed history stays a clean chat and the
+    // agent never sees stale "respond now" imperatives on past turns.
+    lines.push(
+      'You are in a direct chat thread with a staff member — your "operator thread", an ongoing back-and-forth chat. Your reply goes straight back to them.',
+      '',
+      "The staff member's new message is the LAST message in this turn, just below this brief. Reply to it; the earlier user and assistant turns above are history you have already handled, not open requests. Do not re-introduce yourself, and treat the message as complete — do not ask them to resend it.",
+      '',
+      'This wake is your only chance to act — there is no later turn. If the message asks you to look something up, count something, draft, or change something, do it NOW: run the tools, bash, and CLI verbs you need, get the real result, and reply with that result. Never reply "on it", "I\'ll check", "let me look", or "got it" and stop — that leaves the staff member with nothing. If you genuinely cannot get the answer, say exactly what you tried and what blocked you.',
+      '',
+      'A short reply such as "yes", "ok", or "go ahead" approves the action you proposed in your previous message — carry it out now, do not just acknowledge it. Reply in plain text and never echo the staff member\'s message back to them. If the message asks you to remember or record something, actually perform the write instead of claiming it is "logged". Per-tool guidance is in your AGENTS.md `## Tool guidance` section.',
+    )
+  } else {
+    lines.push(
+      `You were woken by your **${data.reason ?? 'scheduled'}** heartbeat.`,
+      '',
+      'This is a review-and-plan run. Survey the org via `summarize_inbox`, scan `/INDEX.md`, decide if any drafts/outreach are warranted, and produce a brief written summary in your MEMORY.md or skills folder when done.',
+    )
+  }
+  return lines.join('\n')
+}

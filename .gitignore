@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+.env.local
+*.log
+.DS_Store
+.omc/
+.data/
+# Project-local vobase CLI configs (`vobase auth login --local`) — holds an API key.
+.vobase/
